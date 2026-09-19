@@ -87,7 +87,7 @@ class GuildPlayer:
         # particular, android_vr is no longer a reliable token-free client,
         # so do not force it here. Try clients that can still expose HLS or
         # token-free/SABR formats, then let yt-dlp use its current defaults.
-        client_variants = ["web_safari", "tv", "web_embedded", None]
+        client_variants = ["mweb", "web_safari", "tv", "web_embedded", None]
         errors = []
 
         for client in client_variants:
