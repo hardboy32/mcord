@@ -18,6 +18,7 @@ class Track:
     title: str
     path: Path
     requested_by: str = "unknown"
+    query: str = ""
 
 
 class GuildPlayer:
@@ -28,6 +29,9 @@ class GuildPlayer:
         self.queue = []
         self.current = None
         self.temp_files = set()
+        # off = no loop, song = repeat current song, queue = repeat the queue
+        self.loop_mode = "off"
+        self.loop_items = []
 
     def _new_voice_client(self):
         self.voice = VoiceClient(
@@ -70,6 +74,7 @@ class GuildPlayer:
                 self.voice = None
 
         self.current = None
+        self.loop_items.clear()
         for p in list(self.temp_files):
             try:
                 p.unlink(missing_ok=True)
@@ -153,7 +158,7 @@ class GuildPlayer:
                     path = Path(lines[-1])
                     if path.exists():
                         self.temp_files.add(path)
-                        return Track(lines[-2], path)
+                        return Track(lines[-2], path, query=query)
 
             error = stderr.decode("utf-8", "replace").strip()
             diagnostics = [
@@ -177,8 +182,22 @@ class GuildPlayer:
         raise RuntimeError("YouTube extraction failed. " + " | ".join(errors))
 
     async def play_next(self):
-        if self.connection is None or not self.queue:
+        if self.connection is None:
             return
+
+        if not self.queue:
+            if self.loop_mode == "queue" and self.loop_items:
+                # Rebuild the same playlist by downloading each saved query again.
+                # This keeps disk usage low and makes loop-all work even after
+                # previous temporary files have been deleted.
+                for item in self.loop_items:
+                    try:
+                        self.queue.append(await self.download(item))
+                    except Exception:
+                        log.exception("Could not reload loop item: %s", item)
+
+            if not self.queue:
+                return
 
         t = self.queue.pop(0)
         self.current = t
@@ -196,6 +215,14 @@ class GuildPlayer:
             except OSError:
                 pass
             self.temp_files.discard(t.path)
+
+            # Repeat one track by resolving/downloading it again after playback.
+            if self.loop_mode == "song" and t.query:
+                try:
+                    self.queue.insert(0, await self.download(t.query))
+                except Exception:
+                    log.exception("Could not reload looped song: %s", t.query)
+
             self.current = None
 
         if self.queue:
@@ -203,6 +230,12 @@ class GuildPlayer:
 
     async def add(self, t):
         self.queue.append(t)
+
+        # Keep the requested queue as the playlist for loop-all.
+        # Avoid duplicates when the same track is already represented.
+        if self.loop_mode == "queue":
+            self.loop_items.append(t.query)
+
         pos = len(self.queue)
 
         if self.current is None and self.connection is not None:
@@ -210,8 +243,20 @@ class GuildPlayer:
 
         return pos
 
+    async def set_loop(self, mode):
+        self.loop_mode = mode
+        if mode == "off":
+            self.loop_items.clear()
+        elif mode == "queue":
+            # Current queued items become the repeat playlist.
+            self.loop_items = [t.query for t in self.queue if t.query]
+
+        return self.loop_mode
+
     async def stop(self):
         self.queue.clear()
+        self.loop_items.clear()
+        self.loop_mode = "off"
 
         if self.connection is not None:
             try:
@@ -281,6 +326,29 @@ class MusicBot:
                 await interaction.followup.send(
                     f"پخش نشد: {str(exc)[:700]}"
                 )
+
+        @self.bot.tree.command(name="loop", description="حالت تکرار پخش")
+        @app_commands.describe(mode="حالت تکرار")
+        @app_commands.choices(mode=[
+            app_commands.Choice(name="خاموش", value="off"),
+            app_commands.Choice(name="همین آهنگ", value="song"),
+            app_commands.Choice(name="کل صف", value="queue"),
+        ])
+        async def loop(interaction: discord.Interaction, mode: str):
+            if interaction.guild is None:
+                return await interaction.response.send_message(
+                    "این دستور فقط داخل سرور قابل استفاده است."
+                )
+
+            player = self.player(str(interaction.guild.id))
+            await player.set_loop(mode)
+
+            labels = {
+                "off": "خاموش شد.",
+                "song": "تکرار همین آهنگ فعال شد.",
+                "queue": "تکرار کل صف فعال شد.",
+            }
+            await interaction.response.send_message(f"🔁 {labels[mode]}")
 
         @self.bot.tree.command(name="skip", description="آهنگ بعدی")
         async def skip(interaction):
