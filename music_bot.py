@@ -40,8 +40,6 @@ class GuildPlayer:
         if self.connection is not None:
             await self._leave_connection_only()
 
-        # A VoiceClient becomes permanently unusable after shutdown, so create
-        # a fresh one whenever the previous client was closed.
         if self.voice is None:
             self._new_voice_client()
 
@@ -67,7 +65,6 @@ class GuildPlayer:
             except Exception:
                 log.exception("voice shutdown failed")
             finally:
-                # Do not reuse a VoiceClient after shutdown.
                 self.voice = None
 
         self.current = None
@@ -84,8 +81,8 @@ class GuildPlayer:
         out = d / "%(id)s.%(ext)s"
         target = query if query.startswith(("http://", "https://")) else "ytsearch1:" + query
 
-        # Download first and join voice immediately afterwards. This prevents
-        # a voice session from sitting idle while YouTube extraction runs.
+        # yt-dlp needs both ffmpeg and ffprobe for audio extraction/postprocessing.
+        ffmpeg_dir = str(Path(self.config.ffmpeg_path).resolve().parent)
         client_variants = [None, "web_embedded"]
         errors = []
 
@@ -96,6 +93,7 @@ class GuildPlayer:
                 "--extract-audio",
                 "--audio-format", "mp3",
                 "--audio-quality", "5",
+                "--ffmpeg-location", ffmpeg_dir,
                 "--js-runtimes", "deno",
                 "--print", "after_move:title",
                 "--print", "after_move:filepath",
@@ -212,8 +210,6 @@ class MusicBot:
             player = self.player(str(interaction.guild.id))
 
             try:
-                # Download before opening voice, so the voice session does not
-                # sit idle while yt-dlp is working.
                 track = await player.download(query)
                 track.requested_by = str(interaction.user)
 
