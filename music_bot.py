@@ -106,6 +106,8 @@ class GuildPlayer:
             ]
             if client:
                 cmd += ["--extractor-args", f"youtube:player_client={client}"]
+            if self.config.bgutil_path:
+                cmd += ["--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"]
             cmd.append(target)
 
             p = await asyncio.create_subprocess_exec(
