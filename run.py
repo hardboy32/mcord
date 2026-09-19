@@ -37,15 +37,22 @@ if config.bgutil_path:
         "BgUtils POT provider starting on 127.0.0.1:4416"
     )
 
-    # Wait briefly so yt-dlp never races the provider during startup.
+    # Deno may take several seconds on the first run while it initializes
+    # npm dependencies. Do not give up after only a few seconds, otherwise
+    # the bot can start before the POT server is actually listening.
     provider_ready = False
-    for _ in range(30):
+    for _ in range(120):
         if provider_process.poll() is not None:
             break
         try:
-            with urllib.request.urlopen("http://127.0.0.1:4416", timeout=0.5):
+            with urllib.request.urlopen("http://127.0.0.1:4416/", timeout=0.5):
                 provider_ready = True
                 break
+        except urllib.error.HTTPError:
+            # The server is listening even if a health endpoint returns a
+            # non-2xx response.
+            provider_ready = True
+            break
         except Exception:
             time.sleep(0.25)
 
