@@ -6,7 +6,7 @@ https://mcord.ir/downloads/sdk/mcord_discord-0.1.7-py3-none-any.whl
 https://mcord.ir/downloads/sdk/mcord_voice-0.1.2-py3-none-any.whl
 
 # Music search/download
-yt-dlp>=2025.1.0
+yt-dlp[default]>=2025.1.0
 
 # Discord voice support
 PyNaCl
