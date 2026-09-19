@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import base64
 import logging
 import os
 import tempfile
@@ -87,7 +88,19 @@ class GuildPlayer:
         # YouTube can require both a PO token and, for some IPs/sessions,
         # valid browser cookies. Keep cookies optional and use them
         # automatically when the operator has supplied a cookies file.
+        #
+        # Infrlo may not provide a file-upload UI, so a base64-encoded
+        # cookies.txt can also be supplied as a secret environment variable.
         cookies_file = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
+        cookies_b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+        if not cookies_file and cookies_b64:
+            generated_cookie_file = d / "youtube_cookies.txt"
+            try:
+                generated_cookie_file.write_bytes(base64.b64decode(cookies_b64))
+                cookies_file = str(generated_cookie_file)
+                log.info("YouTube cookies loaded from YOUTUBE_COOKIES_B64.")
+            except Exception:
+                log.exception("Could not decode YOUTUBE_COOKIES_B64.")
 
         # Allow the operator to upload cookies without having to guess the
         # container working directory. The explicit env var still wins.
