@@ -83,9 +83,11 @@ class GuildPlayer:
 
         ffmpeg_dir = str(Path(self.config.ffmpeg_path).resolve().parent)
 
-        # web_embedded currently avoids the PO-token requirement for GVS and is
-        # tried first. The default client remains as a fallback.
-        client_variants = ["web_embedded", None]
+        # Prefer clients that currently avoid the most common PO-token path.
+        # android_vr does not require a PO token for GVS; web_embedded is also
+        # token-free but only works for embeddable videos. Keep the normal
+        # extractor as a final fallback because YouTube changes these rules.
+        client_variants = ["android_vr", "web_embedded", None]
         errors = []
 
         for client in client_variants:
