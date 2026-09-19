@@ -8,6 +8,9 @@ https://mcord.ir/downloads/sdk/mcord_voice-0.1.2-py3-none-any.whl
 # Music search/download
 yt-dlp[default]>=2025.1.0
 
+# Portable ffmpeg + ffprobe fallback for hosts where apt packages are not available at runtime
+static-ffmpeg>=3,<4
+
 # Discord voice support
 PyNaCl
 davey
