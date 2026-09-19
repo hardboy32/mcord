@@ -21,30 +21,55 @@ class Track:
 class GuildPlayer:
     def __init__(self, config):
         self.config = config
-        self.voice = VoiceClient(token=config.bot_token, api_base=config.api_base)
+        self.voice = None
         self.connection = None
         self.queue = []
         self.current = None
         self.temp_files = set()
 
+    def _new_voice_client(self):
+        self.voice = VoiceClient(
+            token=self.config.bot_token,
+            api_base=self.config.api_base,
+        )
+
     async def join(self, guild_id, channel_id):
         if self.connection is not None and getattr(self.connection, "channel_id", None) == channel_id:
             return
-        if self.connection is not None:
-            await self.leave()
-        self.connection = await self.voice.join(guild_id=guild_id, channel_id=channel_id)
 
-    async def leave(self):
+        if self.connection is not None:
+            await self._leave_connection_only()
+
+        # A VoiceClient becomes permanently unusable after shutdown, so create
+        # a fresh one whenever the previous client was closed.
+        if self.voice is None:
+            self._new_voice_client()
+
+        self.connection = await self.voice.join(
+            guild_id=guild_id,
+            channel_id=channel_id,
+        )
+
+    async def _leave_connection_only(self):
         if self.connection is not None:
             try:
                 await self.connection.leave()
             except Exception:
                 log.exception("voice leave failed")
             self.connection = None
-        try:
-            await self.voice.shutdown()
-        except Exception:
-            log.exception("voice shutdown failed")
+
+    async def leave(self):
+        await self._leave_connection_only()
+
+        if self.voice is not None:
+            try:
+                await self.voice.shutdown()
+            except Exception:
+                log.exception("voice shutdown failed")
+            finally:
+                # Do not reuse a VoiceClient after shutdown.
+                self.voice = None
+
         self.current = None
         for p in list(self.temp_files):
             try:
@@ -59,8 +84,8 @@ class GuildPlayer:
         out = d / "%(id)s.%(ext)s"
         target = query if query.startswith(("http://", "https://")) else "ytsearch1:" + query
 
-        # YouTube increasingly requires an external JS runtime. Deno is installed
-        # by the deployment build and is enabled explicitly here.
+        # Download first and join voice immediately afterwards. This prevents
+        # a voice session from sitting idle while YouTube extraction runs.
         client_variants = [None, "web_embedded"]
         errors = []
 
@@ -103,44 +128,52 @@ class GuildPlayer:
             errors.append(f"{client or 'default'}: {error[-1200:]}")
 
         raise RuntimeError(
-            "YouTube extraction failed. "
-            + " | ".join(errors)
+            "YouTube extraction failed. " + " | ".join(errors)
         )
 
     async def play_next(self):
         if self.connection is None or not self.queue:
             return
+
         t = self.queue.pop(0)
         self.current = t
-        resource = create_audio_resource(
-            str(t.path),
-            ffmpeg_path=self.config.ffmpeg_path,
-        )
-        await self.connection.play(resource)
-        await self.connection.wait_until_idle()
+
         try:
-            t.path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        self.temp_files.discard(t.path)
-        self.current = None
+            resource = create_audio_resource(
+                str(t.path),
+                ffmpeg_path=self.config.ffmpeg_path,
+            )
+            await self.connection.play(resource)
+            await self.connection.wait_until_idle()
+        finally:
+            try:
+                t.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.temp_files.discard(t.path)
+            self.current = None
+
         if self.queue:
             await self.play_next()
 
     async def add(self, t):
         self.queue.append(t)
         pos = len(self.queue)
+
         if self.current is None and self.connection is not None:
             asyncio.create_task(self.play_next())
+
         return pos
 
     async def stop(self):
         self.queue.clear()
+
         if self.connection is not None:
             try:
                 await self.connection.stop()
             except Exception:
                 pass
+
         self.current = None
 
 
@@ -160,30 +193,55 @@ class MusicBot:
         @app_commands.describe(query="نام آهنگ یا لینک")
         async def play(interaction: discord.Interaction, query: str):
             await interaction.response.defer()
+
             if interaction.guild is None:
-                return await interaction.followup.send("این دستور فقط داخل سرور قابل استفاده است.")
-            channel = getattr(getattr(interaction.user, "voice", None), "channel", None)
+                return await interaction.followup.send(
+                    "این دستور فقط داخل سرور قابل استفاده است."
+                )
+
+            channel = getattr(
+                getattr(interaction.user, "voice", None),
+                "channel",
+                None,
+            )
             if channel is None:
-                return await interaction.followup.send("اول وارد Voice Channel شو.")
+                return await interaction.followup.send(
+                    "اول وارد Voice Channel شو."
+                )
+
             player = self.player(str(interaction.guild.id))
+
             try:
-                await player.join(str(interaction.guild.id), str(channel.id))
+                # Download before opening voice, so the voice session does not
+                # sit idle while yt-dlp is working.
                 track = await player.download(query)
                 track.requested_by = str(interaction.user)
+
+                await player.join(
+                    str(interaction.guild.id),
+                    str(channel.id),
+                )
+
                 pos = await player.add(track)
                 await interaction.followup.send(
                     f"آهنگ {track.title} به صف اضافه شد. جایگاه: {pos}"
                 )
             except Exception as exc:
                 log.exception("play failed")
-                await interaction.followup.send(f"پخش نشد: {str(exc)[:700]}")
+                await interaction.followup.send(
+                    f"پخش نشد: {str(exc)[:700]}"
+                )
 
         @self.bot.tree.command(name="skip", description="آهنگ بعدی")
         async def skip(interaction):
             await interaction.response.defer()
             player = self.player(str(interaction.guild.id))
+
             if player.connection is None:
-                return await interaction.followup.send("چیزی در حال پخش نیست.")
+                return await interaction.followup.send(
+                    "چیزی در حال پخش نیست."
+                )
+
             await player.connection.stop()
             await interaction.followup.send("رفتن به آهنگ بعدی.")
 
@@ -193,11 +251,14 @@ class MusicBot:
             player = self.player(str(interaction.guild.id))
             await player.stop()
             await player.leave()
-            await interaction.followup.send("پخش متوقف شد و از Voice خارج شدم.")
+            await interaction.followup.send(
+                "پخش متوقف شد و از Voice خارج شدم."
+            )
 
         @self.bot.tree.command(name="queue", description="نمایش صف")
         async def queue(interaction):
             player = self.player(str(interaction.guild.id))
+
             lines = (
                 [f"در حال پخش: {player.current.title}"]
                 if player.current
@@ -206,6 +267,7 @@ class MusicBot:
                 f"{i}. {t.title}"
                 for i, t in enumerate(player.queue, 1)
             ]
+
             await interaction.response.send_message(
                 "صف خالی است."
                 if not lines
@@ -216,8 +278,12 @@ class MusicBot:
         async def pause(interaction):
             await interaction.response.defer()
             player = self.player(str(interaction.guild.id))
+
             if player.connection is None:
-                return await interaction.followup.send("چیزی در حال پخش نیست.")
+                return await interaction.followup.send(
+                    "چیزی در حال پخش نیست."
+                )
+
             await player.connection.pause()
             await interaction.followup.send("پخش مکث شد.")
 
@@ -225,7 +291,11 @@ class MusicBot:
         async def resume(interaction):
             await interaction.response.defer()
             player = self.player(str(interaction.guild.id))
+
             if player.connection is None:
-                return await interaction.followup.send("چیزی برای ادامه نیست.")
+                return await interaction.followup.send(
+                    "چیزی برای ادامه نیست."
+                )
+
             await player.connection.resume()
             await interaction.followup.send("پخش ادامه پیدا کرد.")
