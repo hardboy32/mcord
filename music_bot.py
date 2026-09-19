@@ -81,9 +81,11 @@ class GuildPlayer:
         out = d / "%(id)s.%(ext)s"
         target = query if query.startswith(("http://", "https://")) else "ytsearch1:" + query
 
-        # yt-dlp needs both ffmpeg and ffprobe for audio extraction/postprocessing.
         ffmpeg_dir = str(Path(self.config.ffmpeg_path).resolve().parent)
-        client_variants = [None, "web_embedded"]
+
+        # web_embedded currently avoids the PO-token requirement for GVS and is
+        # tried first. The default client remains as a fallback.
+        client_variants = ["web_embedded", None]
         errors = []
 
         for client in client_variants:
@@ -94,7 +96,8 @@ class GuildPlayer:
                 "--audio-format", "mp3",
                 "--audio-quality", "5",
                 "--ffmpeg-location", ffmpeg_dir,
-                "--js-runtimes", "deno",
+                "--js-runtimes", f"deno:{self.config.deno_path}",
+                "--remote-components", "ejs:npm",
                 "--print", "after_move:title",
                 "--print", "after_move:filepath",
                 "--output", str(out),
@@ -125,9 +128,7 @@ class GuildPlayer:
             error = stderr.decode("utf-8", "replace").strip()
             errors.append(f"{client or 'default'}: {error[-1200:]}")
 
-        raise RuntimeError(
-            "YouTube extraction failed. " + " | ".join(errors)
-        )
+        raise RuntimeError("YouTube extraction failed. " + " | ".join(errors))
 
     async def play_next(self):
         if self.connection is None or not self.queue:
@@ -234,9 +235,7 @@ class MusicBot:
             player = self.player(str(interaction.guild.id))
 
             if player.connection is None:
-                return await interaction.followup.send(
-                    "چیزی در حال پخش نیست."
-                )
+                return await interaction.followup.send("چیزی در حال پخش نیست.")
 
             await player.connection.stop()
             await interaction.followup.send("رفتن به آهنگ بعدی.")
@@ -247,39 +246,27 @@ class MusicBot:
             player = self.player(str(interaction.guild.id))
             await player.stop()
             await player.leave()
-            await interaction.followup.send(
-                "پخش متوقف شد و از Voice خارج شدم."
-            )
+            await interaction.followup.send("پخش متوقف شد و از Voice خارج شدم.")
 
         @self.bot.tree.command(name="queue", description="نمایش صف")
         async def queue(interaction):
             player = self.player(str(interaction.guild.id))
-
             lines = (
                 [f"در حال پخش: {player.current.title}"]
                 if player.current
                 else []
-            ) + [
-                f"{i}. {t.title}"
-                for i, t in enumerate(player.queue, 1)
-            ]
+            ) + [f"{i}. {t.title}" for i, t in enumerate(player.queue, 1)]
 
             await interaction.response.send_message(
-                "صف خالی است."
-                if not lines
-                else "صف پخش:\n" + "\n".join(lines[:20])
+                "صف خالی است." if not lines else "صف پخش:\n" + "\n".join(lines[:20])
             )
 
         @self.bot.tree.command(name="pause", description="مکث پخش")
         async def pause(interaction):
             await interaction.response.defer()
             player = self.player(str(interaction.guild.id))
-
             if player.connection is None:
-                return await interaction.followup.send(
-                    "چیزی در حال پخش نیست."
-                )
-
+                return await interaction.followup.send("چیزی در حال پخش نیست.")
             await player.connection.pause()
             await interaction.followup.send("پخش مکث شد.")
 
@@ -287,11 +274,7 @@ class MusicBot:
         async def resume(interaction):
             await interaction.response.defer()
             player = self.player(str(interaction.guild.id))
-
             if player.connection is None:
-                return await interaction.followup.send(
-                    "چیزی برای ادامه نیست."
-                )
-
+                return await interaction.followup.send("چیزی برای ادامه نیست.")
             await player.connection.resume()
             await interaction.followup.send("پخش ادامه پیدا کرد.")
