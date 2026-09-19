@@ -1,4 +1,5 @@
-# Environmentpython-dotenv>=1.0,<2
+# Environment
+python-dotenv>=1.0,<2
 
 # Mcord SDKs
 https://mcord.ir/downloads/sdk/mcord_discord-0.1.7-py3-none-any.whl
@@ -14,4 +15,5 @@ static-ffmpeg>=3,<4
 PyNaCl
 davey
 
+# YouTube PO Token provider
 bgutil-ytdlp-pot-provider==2.0.0
