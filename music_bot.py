@@ -130,9 +130,10 @@ class GuildPlayer:
             cmd = [
                 self.config.ytdlp_path,
                 "--no-playlist",
-                "--extract-audio",
-                "--audio-format", "mp3",
-                "--audio-quality", "5",
+                # Download the original audio stream instead of converting it
+                # to MP3. This removes a full FFmpeg transcode before playback.
+                # M4A/Opus/WebM audio can be decoded directly by FFmpeg.
+                "--format", "bestaudio[ext=m4a]/bestaudio/best",
                 "--ffmpeg-location", ffmpeg_dir,
                 "--js-runtimes", f"deno:{self.config.deno_path}",
                 "--remote-components", "ejs:npm",
@@ -279,13 +280,23 @@ class MusicBot:
             player = self.player(str(interaction.guild.id))
 
             try:
-                track = await player.download(query)
-                track.requested_by = str(interaction.user)
-
-                await player.join(
-                    str(interaction.guild.id),
-                    str(channel.id),
+                # Connect to voice while YouTube is being resolved/downloaded.
+                # These operations are independent, so doing them together
+                # removes voice-connection time from startup latency.
+                join_task = asyncio.create_task(
+                    player.join(
+                        str(interaction.guild.id),
+                        str(channel.id),
+                    )
                 )
+                try:
+                    track = await player.download(query)
+                    track.requested_by = str(interaction.user)
+                    await join_task
+                except Exception:
+                    if not join_task.done():
+                        join_task.cancel()
+                    raise
 
                 pos = await player.add(track)
                 await interaction.followup.send(
