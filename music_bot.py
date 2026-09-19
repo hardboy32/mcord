@@ -90,12 +90,15 @@ class GuildPlayer:
 
         ffmpeg_dir = str(Path(self.config.ffmpeg_path).resolve().parent)
 
+        # Cookies are useful for authenticated/browser-like clients, but YouTube
+        # can react badly when account cookies are sent to clients that do not
+        # support them. Keep them for web clients and skip them for guest clients.
         cookies_file = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
         cookies_b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
         if not cookies_file and cookies_b64:
             generated_cookie_file = d / "youtube_cookies.txt"
             try:
-                generated_cookie_file.write_bytes(base64.b64decode(cookies_b64))
+                generated_cookie_file.write_bytes(base64.b64decode(cookies_b64, validate=True))
                 cookies_file = str(generated_cookie_file)
                 log.info("YouTube cookies loaded from YOUTUBE_COOKIES_B64.")
             except Exception:
@@ -117,10 +120,23 @@ class GuildPlayer:
         else:
             cookies_file = ""
 
-        client_variants = ["tv", "web_safari", "web_embedded", None, "mweb"]
+        proxy = os.getenv("YOUTUBE_PROXY", "").strip()
+        user_agent = os.getenv("YOUTUBE_USER_AGENT", "").strip()
+
+        # Start with clients that do not require a PO token and do not need
+        # account cookies. If YouTube rejects the datacenter IP, fall back to
+        # browser-like clients with cookies + bgutil.
+        client_plans = [
+            ("android_vr", False),
+            ("tv", False),
+            ("web_embedded", True),
+            ("web_safari", True),
+            (None, True),
+            ("mweb", True),
+        ]
         errors = []
 
-        for client in client_variants:
+        for client, use_cookies in client_plans:
             cmd = [
                 self.config.ytdlp_path,
                 "--no-playlist",
@@ -128,18 +144,41 @@ class GuildPlayer:
                 "--ffmpeg-location", ffmpeg_dir,
                 "--js-runtimes", f"deno:{self.config.deno_path}",
                 "--remote-components", "ejs:npm",
-                "--verbose",
+                "--retries", "2",
+                "--fragment-retries", "2",
+                "--socket-timeout", "15",
+                "--no-warnings",
                 "--print", "after_move:title",
                 "--print", "after_move:filepath",
                 "--output", str(out),
             ]
-            if cookies_file and Path(cookies_file).is_file():
+
+            if use_cookies and cookies_file and Path(cookies_file).is_file():
                 cmd += ["--cookies", cookies_file]
+
+            if proxy:
+                cmd += ["--proxy", proxy]
+
+            if user_agent:
+                cmd += ["--user-agent", user_agent]
+
             if client:
                 cmd += ["--extractor-args", f"youtube:player_client={client}"]
+
             if self.config.bgutil_path:
-                cmd += ["--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"]
+                cmd += [
+                    "--extractor-args",
+                    "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
+                ]
+
             cmd.append(target)
+
+            log.info(
+                "Trying YouTube client=%s cookies=%s proxy=%s",
+                client or "default",
+                bool(use_cookies and cookies_file),
+                bool(proxy),
+            )
 
             p = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -167,20 +206,32 @@ class GuildPlayer:
                 if any(
                     marker in line
                     for marker in (
-                        "[pot]", "PO Token", "bgutil", "LOGIN_REQUIRED",
-                        "Sign in to confirm", "PO Token Providers",
-                        "PO Token Cache Providers", "JS Challenge Providers",
+                        "LOGIN_REQUIRED",
+                        "Sign in to confirm",
+                        "HTTP Error 403",
+                        "HTTP Error 429",
                         "playability status",
+                        "Requested format is not available",
+                        "Video unavailable",
+                        "Private video",
+                        "age-restricted",
+                        "ERROR:",
                     )
                 )
             ]
             if diagnostics:
-                error = "\n".join(diagnostics[-12:])
+                error = "\n".join(diagnostics[-10:])
 
-            errors.append(f"{client or 'default'}: {error[-2200:]}")
+            errors.append(f"{client or 'default'}: {error[-1200:]}")
 
-        raise RuntimeError("YouTube extraction failed. " + " | ".join(errors))
+        hint = ""
+        if any("LOGIN_REQUIRED" in e or "Sign in to confirm" in e for e in errors):
+            hint = (
+                " YouTube is rejecting the server/IP. "
+                "If this continues, set YOUTUBE_PROXY to a clean residential/browser IP."
+            )
 
+        raise RuntimeError("YouTube extraction failed." + hint + " " + " | ".join(errors))
     async def play_next(self):
         if self.connection is None:
             return
