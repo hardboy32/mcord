@@ -18,4 +18,4 @@ davey
 # Legacy API adapter files still present in the repository
 httpx>=0.24,<1
 
-bgutil-ytdlp-pot-provider>=2,<3
+bgutil-ytdlp-pot-provider==2.0.0
