@@ -89,6 +89,25 @@ class GuildPlayer:
         # automatically when the operator has supplied a cookies file.
         cookies_file = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
 
+        # Allow the operator to upload cookies without having to guess the
+        # container working directory. The explicit env var still wins.
+        if not cookies_file:
+            for candidate in (
+                Path("/app/Config/youtube_cookies.txt"),
+                Path("/app/youtube_cookies.txt"),
+                Path.cwd() / "Config" / "youtube_cookies.txt",
+                Path.cwd() / "youtube_cookies.txt",
+            ):
+                if candidate.is_file():
+                    cookies_file = str(candidate)
+                    break
+
+        if cookies_file and Path(cookies_file).is_file():
+            log.info("YouTube cookies enabled from %s", cookies_file)
+        else:
+            cookies_file = ""
+            log.info("YouTube cookies not configured.")
+
         # mweb is the main client supported by the current PO-token guide.
         # Keep a few fallbacks because YouTube changes client behaviour often.
         client_variants = ["mweb", "web_safari", "tv", "web_embedded", None]
@@ -104,6 +123,9 @@ class GuildPlayer:
                 "--ffmpeg-location", ffmpeg_dir,
                 "--js-runtimes", f"deno:{self.config.deno_path}",
                 "--remote-components", "ejs:npm",
+                # Keep yt-dlp diagnostics in stderr so we can tell whether
+                # the POT plugin and Deno JS challenge provider are active.
+                "--verbose",
                 "--print", "after_move:title",
                 "--print", "after_move:filepath",
                 "--output", str(out),
@@ -149,6 +171,10 @@ class GuildPlayer:
                         "bgutil",
                         "LOGIN_REQUIRED",
                         "Sign in to confirm",
+                        "PO Token Providers",
+                        "PO Token Cache Providers",
+                        "JS Challenge Providers",
+                        "playability status",
                     )
                 )
             ]
