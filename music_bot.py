@@ -117,7 +117,7 @@ class GuildPlayer:
         else:
             cookies_file = ""
 
-        client_variants = ["mweb", "web_safari", "tv", "web_embedded", None]
+        client_variants = ["tv", "web_safari", "web_embedded", None, "mweb"]
         errors = []
 
         for client in client_variants:
@@ -177,7 +177,7 @@ class GuildPlayer:
             if diagnostics:
                 error = "\n".join(diagnostics[-12:])
 
-            errors.append(f"{client or 'default'}: {error[-1600:]}")
+            errors.append(f"{client or 'default'}: {error[-2200:]}")
 
         raise RuntimeError("YouTube extraction failed. " + " | ".join(errors))
 
