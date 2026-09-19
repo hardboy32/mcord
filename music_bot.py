@@ -83,10 +83,13 @@ class GuildPlayer:
 
         ffmpeg_dir = str(Path(self.config.ffmpeg_path).resolve().parent)
 
-        # YouTube's client/PO-token rules are changing frequently. In
-        # particular, android_vr is no longer a reliable token-free client,
-        # so do not force it here. Try clients that can still expose HLS or
-        # token-free/SABR formats, then let yt-dlp use its current defaults.
+        # YouTube can require both a PO token and, for some IPs/sessions,
+        # valid browser cookies. Keep cookies optional and use them
+        # automatically when the operator has supplied a cookies file.
+        cookies_file = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
+
+        # mweb is the main client supported by the current PO-token guide.
+        # Keep a few fallbacks because YouTube changes client behaviour often.
         client_variants = ["mweb", "web_safari", "tv", "web_embedded", None]
         errors = []
 
@@ -104,6 +107,8 @@ class GuildPlayer:
                 "--print", "after_move:filepath",
                 "--output", str(out),
             ]
+            if cookies_file and Path(cookies_file).is_file():
+                cmd += ["--cookies", cookies_file]
             if client:
                 cmd += ["--extractor-args", f"youtube:player_client={client}"]
             if self.config.bgutil_path:
@@ -130,7 +135,26 @@ class GuildPlayer:
                         return Track(lines[-2], path)
 
             error = stderr.decode("utf-8", "replace").strip()
-            errors.append(f"{client or 'default'}: {error[-1200:]}")
+
+            # Preserve useful PO-token diagnostics without logging cookies.
+            diagnostics = [
+                line.strip()
+                for line in error.splitlines()
+                if any(
+                    marker in line
+                    for marker in (
+                        "[pot]",
+                        "PO Token",
+                        "bgutil",
+                        "LOGIN_REQUIRED",
+                        "Sign in to confirm",
+                    )
+                )
+            ]
+            if diagnostics:
+                error = "\n".join(diagnostics[-12:])
+
+            errors.append(f"{client or 'default'}: {error[-1600:]}")
 
         raise RuntimeError("YouTube extraction failed. " + " | ".join(errors))
 
