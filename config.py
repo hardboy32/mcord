@@ -1,4 +1,5 @@
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from dotenv import load_dotenv
@@ -16,16 +17,35 @@ def resolve_ffmpeg_path() -> str:
     if configured:
         return configured
 
-    # Infrlo may not preserve apt-installed binaries in the runtime PATH.
-    # static-ffmpeg supplies both ffmpeg and ffprobe without root access.
     try:
         from static_ffmpeg import run
-
         ffmpeg, _ffprobe = run.get_or_fetch_platform_executables_else_raise()
         return str(ffmpeg)
     except Exception:
-        # Keep the normal system path as a final fallback.
         return "ffmpeg"
+
+
+def resolve_deno_path() -> str:
+    """Find Deno even when the host does not add ~/.deno/bin to PATH."""
+    configured = os.getenv("DENO_PATH", "").strip()
+    if configured and Path(configured).exists():
+        return configured
+
+    found = shutil.which("deno")
+    if found:
+        return found
+
+    candidates = [
+        Path.home() / ".deno" / "bin" / "deno",
+        Path("/usr/local/bin/deno"),
+        Path("/usr/bin/deno"),
+    ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+
+    # Let yt-dlp produce its normal diagnostic if no runtime is present.
+    return "deno"
 
 
 @dataclass(frozen=True)
@@ -35,6 +55,7 @@ class Config:
     api_base: str = API_BASE
     ytdlp_path: str = "yt-dlp"
     ffmpeg_path: str = "ffmpeg"
+    deno_path: str = "deno"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -48,4 +69,5 @@ class Config:
             bot_token=token,
             ytdlp_path=os.getenv("YTDLP_PATH", "yt-dlp"),
             ffmpeg_path=resolve_ffmpeg_path(),
+            deno_path=resolve_deno_path(),
         )
