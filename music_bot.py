@@ -16,7 +16,7 @@ log = logging.getLogger("mcord-music")
 @dataclass
 class Track:
     title: str
-    path: str
+    path: Path
     requested_by: str = "unknown"
 
 
@@ -78,11 +78,11 @@ class GuildPlayer:
         self.temp_files.clear()
 
     async def download(self, query):
-        # Resolve only the direct audio URL. Do NOT download the whole song
-        # first: the voice layer/FFmpeg can consume the URL as a stream.
         d = Path(tempfile.gettempdir()) / "mcord_music"
         d.mkdir(parents=True, exist_ok=True)
+        out = d / "%(id)s.%(ext)s"
         target = query if query.startswith(("http://", "https://")) else "ytsearch1:" + query
+
         ffmpeg_dir = str(Path(self.config.ffmpeg_path).resolve().parent)
 
         cookies_file = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
@@ -120,11 +120,13 @@ class GuildPlayer:
                 self.config.ytdlp_path,
                 "--no-playlist",
                 "--format", "bestaudio[ext=m4a]/bestaudio/best",
-                "--get-url",
-                "--print", "title",
                 "--ffmpeg-location", ffmpeg_dir,
                 "--js-runtimes", f"deno:{self.config.deno_path}",
                 "--remote-components", "ejs:npm",
+                "--verbose",
+                "--print", "after_move:title",
+                "--print", "after_move:filepath",
+                "--output", str(out),
             ]
             if cookies_file and Path(cookies_file).is_file():
                 cmd += ["--cookies", cookies_file]
@@ -142,25 +144,34 @@ class GuildPlayer:
             stdout, stderr = await p.communicate()
 
             if p.returncode == 0:
-                lines = [x.strip() for x in stdout.decode("utf-8", "replace").splitlines() if x.strip()]
+                lines = [
+                    x.strip()
+                    for x in stdout.decode("utf-8", "replace").splitlines()
+                    if x.strip()
+                ]
                 if len(lines) >= 2:
-                    title, media_url = lines[-2], lines[-1]
-                    if media_url.startswith(("http://", "https://")):
-                        return Track(title, media_url)
+                    path = Path(lines[-1])
+                    if path.exists():
+                        self.temp_files.add(path)
+                        return Track(lines[-2], path)
 
             error = stderr.decode("utf-8", "replace").strip()
             diagnostics = [
                 line.strip()
                 for line in error.splitlines()
-                if any(marker in line for marker in (
-                    "[pot]", "PO Token", "bgutil", "LOGIN_REQUIRED",
-                    "Sign in to confirm", "PO Token Providers",
-                    "PO Token Cache Providers", "JS Challenge Providers",
-                    "playability status",
-                ))
+                if any(
+                    marker in line
+                    for marker in (
+                        "[pot]", "PO Token", "bgutil", "LOGIN_REQUIRED",
+                        "Sign in to confirm", "PO Token Providers",
+                        "PO Token Cache Providers", "JS Challenge Providers",
+                        "playability status",
+                    )
+                )
             ]
             if diagnostics:
                 error = "\n".join(diagnostics[-12:])
+
             errors.append(f"{client or 'default'}: {error[-1600:]}")
 
         raise RuntimeError("YouTube extraction failed. " + " | ".join(errors))
@@ -174,13 +185,17 @@ class GuildPlayer:
 
         try:
             resource = create_audio_resource(
-                t.path,
+                str(t.path),
                 ffmpeg_path=self.config.ffmpeg_path,
             )
             await self.connection.play(resource)
             await self.connection.wait_until_idle()
         finally:
-            # Direct stream URL: no large temporary audio file to delete.
+            try:
+                t.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.temp_files.discard(t.path)
             self.current = None
 
         if self.queue:
@@ -242,9 +257,6 @@ class MusicBot:
             player = self.player(str(interaction.guild.id))
 
             try:
-                # Connect to voice while YouTube is being resolved/downloaded.
-                # These operations are independent, so doing them together
-                # removes voice-connection time from startup latency.
                 join_task = asyncio.create_task(
                     player.join(
                         str(interaction.guild.id),
