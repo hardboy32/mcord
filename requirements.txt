@@ -1,5 +1,4 @@
-# Environment
-python-dotenv>=1.0,<2
+# Environmentpython-dotenv>=1.0,<2
 
 # Mcord SDKs
 https://mcord.ir/downloads/sdk/mcord_discord-0.1.7-py3-none-any.whl
@@ -14,8 +13,5 @@ static-ffmpeg>=3,<4
 # Discord voice support
 PyNaCl
 davey
-
-# Legacy API adapter files still present in the repository
-httpx>=0.24,<1
 
 bgutil-ytdlp-pot-provider==2.0.0
