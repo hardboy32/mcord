@@ -908,18 +908,18 @@ class MusicBot:
 
             if player.connection is None:
                 return await self._temp_followup(
-                interaction,
-                "چیزی در حال پخش نیست.",
-            )
+                    interaction,
+                    "چیزی در حال پخش نیست.",
+                )
 
             if player.playback_interrupt is not None:
                 player.playback_interrupt.set()
 
             await player.connection.stop()
             await self._temp_followup(
-            interaction,
-            "رفتن به آهنگ بعدی.",
-        )
+                interaction,
+                "رفتن به آهنگ بعدی.",
+            )
 
         @self.bot.tree.command(name="stop", description="توقف و خروج از Voice")
         async def stop(interaction):
@@ -928,9 +928,9 @@ class MusicBot:
             await player.stop()
             await player.leave()
             await self._temp_followup(
-            interaction,
-            "پخش متوقف شد و از Voice خارج شدم.",
-        )
+                interaction,
+                "پخش متوقف شد و از Voice خارج شدم.",
+            )
 
         @self.bot.tree.command(name="queue", description="نمایش صف")
         async def queue(interaction):
@@ -941,8 +941,9 @@ class MusicBot:
                 else []
             ) + [f"{i}. {t.title}" for i, t in enumerate(player.queue, 1)]
 
-            await interaction.response.send_message(
-                "صف خالی است." if not lines else "صف پخش:\n" + "\n".join(lines[:20])
+            await self._temp_response(
+                interaction,
+                "صف خالی است." if not lines else "صف پخش:\n" + "\n".join(lines[:20]),
             )
 
         @self.bot.tree.command(name="pause", description="مکث پخش")
@@ -950,12 +951,15 @@ class MusicBot:
             await interaction.response.defer()
             player = self.player(str(interaction.guild.id))
             if player.connection is None:
-                return await interaction.followup.send("چیزی در حال پخش نیست.")
+                return await self._temp_followup(
+                    interaction,
+                    "چیزی در حال پخش نیست.",
+                )
             await player.connection.pause()
             await self._temp_followup(
-            interaction,
-            "پخش مکث شد.",
-        )
+                interaction,
+                "پخش مکث شد.",
+            )
 
         @self.bot.tree.command(name="resume", description="ادامه پخش")
         async def resume(interaction):
@@ -963,11 +967,11 @@ class MusicBot:
             player = self.player(str(interaction.guild.id))
             if player.connection is None:
                 return await self._temp_followup(
-                interaction,
-                "چیزی برای ادامه نیست.",
-            )
+                    interaction,
+                    "چیزی برای ادامه نیست.",
+                )
             await player.connection.resume()
             await self._temp_followup(
-            interaction,
-            "پخش ادامه پیدا کرد.",
-        )
+                interaction,
+                "پخش ادامه پیدا کرد.",
+            )
