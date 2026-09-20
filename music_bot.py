@@ -697,21 +697,30 @@ class MusicBot:
                     f"پخش نشد: {str(exc)[:700]}"
                 )
 
+    @staticmethod
+    def _play_task_done(task: asyncio.Task):
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            log.error("background play task failed: %s", exc, exc_info=exc)
+
     def register(self):
         @self.bot.tree.command(name="play", description="پخش آهنگ از نام یا لینک")
         @app_commands.describe(query="نام آهنگ یا لینک")
         async def play(interaction: discord.Interaction, query: str):
-            # Acknowledge immediately, then do the slow work in a background
-            # task. Discord interaction tokens remain usable for followups,
-            # while this keeps the command callback short.
-            await interaction.response.defer(thinking=True)
+            # Start playback immediately. If Discord's 3-second acknowledgement
+            # window has already expired, that must not cancel the music task.
+            task = asyncio.create_task(self._handle_play(interaction, query))
 
-            if interaction.guild is None:
-                return await interaction.followup.send(
-                    "این دستور فقط داخل سرور قابل استفاده است."
-                )
+            try:
+                await interaction.response.defer(thinking=True)
+            except discord.NotFound:
+                log.warning("play interaction expired before acknowledgement; continuing playback")
+            except discord.HTTPException as exc:
+                log.warning("play interaction acknowledgement failed: %s; continuing playback", exc)
 
-            asyncio.create_task(self._handle_play(interaction, query))
+            task.add_done_callback(self._play_task_done)
 
         @self.bot.tree.command(name="loop", description="حالت تکرار پخش")
         @app_commands.describe(mode="حالت تکرار")
