@@ -1,11 +1,10 @@
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Public Mcord application. Only the bot token is secret.
+# Public Mcord application. Bot tokens are the only secrets.
 APPLICATION_ID = "16"
 API_BASE = "https://mcord.ir"
 
@@ -33,11 +32,11 @@ class Config:
     ffmpeg_path: str = "ffmpeg"
 
     @classmethod
-    def from_env(cls) -> "Config":
-        token = os.getenv("MCORD_BOT_TOKEN", "").strip()
+    def from_env(cls, token_env: str = "MCORD_BOT_TOKEN") -> "Config":
+        token = os.getenv(token_env, "").strip()
         if not token:
             raise RuntimeError(
-                "MCORD_BOT_TOKEN is not set. Add only the Bot Token as an Infrlo environment variable."
+                f"{token_env} is not set. Add the Discord Bot Token as an Infrlo environment variable."
             )
 
         return cls(
