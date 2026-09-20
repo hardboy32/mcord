@@ -3,6 +3,7 @@ import asyncio
 import base64
 import logging
 import os
+import shutil
 import tempfile
 import json
 import urllib.parse
@@ -54,6 +55,9 @@ class GuildPlayer:
         self.temp_files = set()
         self.loop_mode = "off"
         self.loop_items = []
+        # Signals an explicit /skip or /stop so duration-based completion
+        # detection does not hold the queue for the whole song.
+        self.playback_interrupt = None
 
     def _new_voice_client(self):
         self.voice = VoiceClient(
@@ -125,6 +129,10 @@ class GuildPlayer:
             self.connection = None
 
     async def leave(self):
+        if self.playback_interrupt is not None:
+            self.playback_interrupt.set()
+            self.playback_interrupt = None
+
         await self._leave_connection_only()
 
         if self.voice is not None:
@@ -555,6 +563,79 @@ class GuildPlayer:
             "YouTube extraction failed." + hint + " " + " | ".join(errors[-6:])
         )
 
+    async def _media_duration(self, path: Path) -> float | None:
+        """Read the real media duration without blocking the Discord gateway."""
+        ffprobe = os.getenv("FFPROBE_PATH", "").strip()
+        if not ffprobe:
+            candidate = Path(self.config.ffmpeg_path).with_name("ffprobe")
+            if candidate.is_file():
+                ffprobe = str(candidate)
+            else:
+                ffprobe = shutil.which("ffprobe") or "ffprobe"
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                ffprobe,
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate()
+            if process.returncode != 0:
+                log.warning(
+                    "ffprobe failed for %s: %s",
+                    path,
+                    stderr.decode("utf-8", "replace").strip()[-500:],
+                )
+                return None
+
+            duration = float(stdout.decode("utf-8", "replace").strip())
+            if duration <= 0:
+                return None
+            log.info(
+                "Media duration: title=%s duration=%.2fs size=%d",
+                self.current.title if self.current else path.name,
+                duration,
+                path.stat().st_size,
+            )
+            return duration
+        except Exception:
+            log.exception("Could not probe media duration: %s", path)
+            return None
+
+    async def _wait_for_playback_end(self, path: Path) -> None:
+        """Wait for actual media length before trusting mcord_voice idle state.
+
+        mcord_voice can report idle immediately after play() on a fresh
+        connection. Waiting for the media duration prevents premature source
+        deletion. An explicit skip/stop interrupts this wait immediately.
+        """
+        duration = await self._media_duration(path)
+        if duration is not None:
+            interrupt = asyncio.Event()
+            self.playback_interrupt = interrupt
+            try:
+                try:
+                    await asyncio.wait_for(interrupt.wait(), timeout=max(0.25, duration + 0.35))
+                    return
+                except asyncio.TimeoutError:
+                    pass
+            finally:
+                if self.playback_interrupt is interrupt:
+                    self.playback_interrupt = None
+
+        # Keep the SDK's own completion check as the final confirmation when
+        # possible. At this point the media should have had enough time to
+        # finish, so an early idle result is harmless.
+        if self.connection is not None:
+            try:
+                await self.connection.wait_until_idle()
+            except Exception:
+                log.exception("wait_until_idle failed after duration-based wait")
+
     async def play_next(self):
         if self.connection is None:
             log.warning("play_next skipped: no voice connection")
@@ -585,15 +666,7 @@ class GuildPlayer:
             await self.connection.play(resource)
             log.info("Audio playback started: title=%s", t.title)
 
-            # mcord_voice starts playback asynchronously. On a fresh voice
-            # connection, wait_until_idle() can observe the connection before
-            # the player has switched to the playing state and return
-            # immediately. If we delete the source file at that point, FFmpeg
-            # loses its input and the song stops after a few milliseconds.
-            # Give the playback worker a moment to enter the playing state
-            # before waiting for the real idle transition.
-            await asyncio.sleep(0.5)
-            await self.connection.wait_until_idle()
+            await self._wait_for_playback_end(t.path)
             log.info("Audio playback finished: title=%s", t.title)
         finally:
             try:
@@ -636,6 +709,7 @@ class GuildPlayer:
         if exc:
             log.error("Playback task failed: %s", exc, exc_info=exc)
 
+
     async def set_loop(self, mode):
         self.loop_mode = mode
         if mode == "off":
@@ -648,6 +722,9 @@ class GuildPlayer:
         self.queue.clear()
         self.loop_items.clear()
         self.loop_mode = "off"
+
+        if self.playback_interrupt is not None:
+            self.playback_interrupt.set()
 
         if self.connection is not None:
             try:
@@ -784,6 +861,9 @@ class MusicBot:
 
             if player.connection is None:
                 return await interaction.followup.send("چیزی در حال پخش نیست.")
+
+            if player.playback_interrupt is not None:
+                player.playback_interrupt.set()
 
             await player.connection.stop()
             await interaction.followup.send("رفتن به آهنگ بعدی.")
