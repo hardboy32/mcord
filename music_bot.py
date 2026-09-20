@@ -557,6 +557,7 @@ class GuildPlayer:
 
     async def play_next(self):
         if self.connection is None:
+            log.warning("play_next skipped: no voice connection")
             return
 
         if not self.queue:
@@ -574,13 +575,17 @@ class GuildPlayer:
         self.current = t
 
         try:
+            log.info("Preparing audio resource: title=%s path=%s", t.title, t.path)
             resource = await asyncio.to_thread(
                 create_audio_resource,
                 str(t.path),
                 ffmpeg_path=self.config.ffmpeg_path,
             )
+            log.info("Audio resource ready: title=%s", t.title)
             await self.connection.play(resource)
+            log.info("Audio playback started: title=%s", t.title)
             await self.connection.wait_until_idle()
+            log.info("Audio playback finished: title=%s", t.title)
         finally:
             try:
                 t.path.unlink(missing_ok=True)
@@ -607,9 +612,20 @@ class GuildPlayer:
         pos = len(self.queue)
 
         if self.current is None and self.connection is not None:
-            asyncio.create_task(self.play_next())
+            log.info("Starting playback task: title=%s queue_position=%s", t.title, pos)
+            task = asyncio.create_task(self.play_next())
+            task.add_done_callback(self._playback_task_done)
 
         return pos
+
+    @staticmethod
+    def _playback_task_done(task: asyncio.Task):
+        if task.cancelled():
+            log.warning("Playback task was cancelled.")
+            return
+        exc = task.exception()
+        if exc:
+            log.error("Playback task failed: %s", exc, exc_info=exc)
 
     async def set_loop(self, mode):
         self.loop_mode = mode
@@ -688,14 +704,21 @@ class MusicBot:
                 track.requested_by = str(interaction.user)
                 pos = await player.add(track)
 
-                await interaction.followup.send(
-                    f"آهنگ {track.title} به صف اضافه شد. جایگاه: {pos}"
-                )
+                log.info("Track queued successfully: title=%s position=%s", track.title, pos)
+                try:
+                    await interaction.followup.send(
+                        f"آهنگ {track.title} به صف اضافه شد. جایگاه: {pos}"
+                    )
+                except (discord.NotFound, discord.HTTPException) as send_exc:
+                    log.warning("Could not send play success message: %s", send_exc)
             except Exception as exc:
                 log.exception("play failed")
-                await interaction.followup.send(
-                    f"پخش نشد: {str(exc)[:700]}"
-                )
+                try:
+                    await interaction.followup.send(
+                        f"پخش نشد: {str(exc)[:700]}"
+                    )
+                except (discord.NotFound, discord.HTTPException) as send_exc:
+                    log.warning("Could not send play error message: %s", send_exc)
 
     @staticmethod
     def _play_task_done(task: asyncio.Task):
