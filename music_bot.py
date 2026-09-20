@@ -231,6 +231,11 @@ class GuildPlayer:
         """Search/download a SoundCloud track without touching YouTube."""
         parsed = urllib.parse.urlparse(query)
         is_url = bool(parsed.netloc and "soundcloud.com" in parsed.netloc.lower())
+
+        # Do not send YouTube/other URLs to the SoundCloud search extractor.
+        if query.startswith(("http://", "https://")) and not is_url:
+            raise RuntimeError("not a SoundCloud URL")
+
         target = query if is_url else f"scsearch1:{query}"
 
         out_dir = Path(tempfile.gettempdir()) / "mcord_music"
