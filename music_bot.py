@@ -597,54 +597,88 @@ class MusicBot:
         self.bot = bot
         self.config = config
         self.players = {}
+        # Keep one play operation per guild at a time. Voice connection
+        # negotiation can take several seconds on hosted environments, and
+        # overlapping joins can trigger LiveKit reconnects.
+        self.play_locks = {}
 
     def player(self, guild_id):
         if guild_id not in self.players:
             self.players[guild_id] = GuildPlayer(self.config)
         return self.players[guild_id]
 
-    def register(self):
-        @self.bot.tree.command(name="play", description="پخش آهنگ از نام یا لینک")
-        @app_commands.describe(query="نام آهنگ یا لینک")
-        async def play(interaction: discord.Interaction, query: str):
-            await interaction.response.defer()
+    def play_lock(self, guild_id):
+        if guild_id not in self.play_locks:
+            self.play_locks[guild_id] = asyncio.Lock()
+        return self.play_locks[guild_id]
 
-            if interaction.guild is None:
-                return await interaction.followup.send(
-                    "این دستور فقط داخل سرور قابل استفاده است."
-                )
+    async def _handle_play(self, interaction, query):
+        guild_id = str(interaction.guild.id)
+        channel = getattr(
+            getattr(interaction.user, "voice", None),
+            "channel",
+            None,
+        )
 
-            channel = getattr(
-                getattr(interaction.user, "voice", None),
-                "channel",
-                None,
+        if channel is None:
+            return await interaction.followup.send(
+                "اول وارد Voice Channel شو."
             )
-            if channel is None:
-                return await interaction.followup.send(
-                    "اول وارد Voice Channel شو."
-                )
 
-            player = self.player(str(interaction.guild.id))
+        lock = self.play_lock(guild_id)
+        if lock.locked():
+            return await interaction.followup.send(
+                "یک آهنگ دیگر در حال آماده‌سازی است؛ چند لحظه صبر کن."
+            )
 
+        async with lock:
+            player = self.player(guild_id)
             try:
-                # Do not start LiveKit while the external resolver is working.
-                # This avoids voice reconnect storms and reduces gateway lag.
+                # Extraction happens outside the Discord interaction handler.
                 track = await player.download(query)
-                await player.join(
-                    str(interaction.guild.id),
-                    str(channel.id),
-                )
-                track.requested_by = str(interaction.user)
 
+                # Join only after the file is ready. This avoids keeping a
+                # LiveKit connection half-open while YouTube is resolving.
+                await asyncio.wait_for(
+                    player.join(
+                        guild_id,
+                        str(channel.id),
+                    ),
+                    timeout=35,
+                )
+
+                track.requested_by = str(interaction.user)
                 pos = await player.add(track)
+
                 await interaction.followup.send(
                     f"آهنگ {track.title} به صف اضافه شد. جایگاه: {pos}"
+                )
+            except asyncio.TimeoutError:
+                log.error("LiveKit join timed out for guild=%s", guild_id)
+                await interaction.followup.send(
+                    "اتصال Voice خیلی طول کشید و لغو شد. دوباره /play را امتحان کن."
                 )
             except Exception as exc:
                 log.exception("play failed")
                 await interaction.followup.send(
                     f"پخش نشد: {str(exc)[:700]}"
                 )
+
+    def register(self):
+        @self.bot.tree.command(name="play", description="پخش آهنگ از نام یا لینک")
+        @app_commands.describe(query="نام آهنگ یا لینک")
+        async def play(interaction: discord.Interaction, query: str):
+            # Acknowledge immediately, then do the slow work in a background
+            # task. Discord interaction tokens remain usable for followups,
+            # while this keeps the command callback short.
+            await interaction.response.defer(thinking=True)
+
+            if interaction.guild is None:
+                return await interaction.followup.send(
+                    "این دستور فقط داخل سرور قابل استفاده است."
+                )
+
+            asyncio.create_task(self._handle_play(interaction, query))
 
         @self.bot.tree.command(name="loop", description="حالت تکرار پخش")
         @app_commands.describe(mode="حالت تکرار")
