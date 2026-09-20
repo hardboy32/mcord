@@ -535,8 +535,7 @@ class GuildPlayer:
                     )
                 ]
                 if diagnostics:
-                    error = "
-".join(diagnostics[-8:])
+                    error = "\n".join(diagnostics[-8:])
                 errors.append(f"{client or 'default'}: {error[-1000:]}")
             except Exception as exc:
                 errors.append(f"{client or 'default'}: {exc}")
