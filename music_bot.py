@@ -33,7 +33,6 @@ INVIDIOUS_INSTANCES = [
     "https://invidious.nerdvpn.de",
     "https://yt.chocolatemoo53.com",
     "https://invidious.tiekoetter.com",
-    "https://invidious.f5.si",
 ]
 
 
@@ -605,6 +604,7 @@ class GuildPlayer:
             hint = (
                 " YouTube is rejecting the hosting IP. "
                 "The bot tried Invidious proxying and public Piped fallbacks too."
+                " A working HTTP/HTTPS proxy in YOUTUBE_PROXY is required if the hosting IP remains blocked."
             )
 
         raise RuntimeError(
