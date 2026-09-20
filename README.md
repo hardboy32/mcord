@@ -15,8 +15,10 @@ YouTube:
 - `YOUTUBE_COOKIES_B64` is optional and should only be configured as an Infrlo secret/environment variable.
 - Never commit `cookies.txt` or cookie contents to this repository.
 - The bot tries multiple YouTube player clients automatically.
-- `YOUTUBE_PROXY` is an optional fallback when the hosting provider's IP is blocked by YouTube.
+- If direct YouTube extraction is blocked, the bot automatically tries several public Piped backends as a second extraction path.
+- `YOUTUBE_PROXY` is an optional fallback when both direct extraction and the Piped fallback are unavailable.
 - `YOUTUBE_USER_AGENT` can be set when a proxy/cookie session requires a matching browser User-Agent.
+- No paid proxy is required by the code; public Piped instances are used only as a best-effort fallback and may change availability.
 
 The bot also installs Deno, ffmpeg and the bgutil PO Token provider automatically when the host does not provide them.
 
