@@ -30,6 +30,7 @@ PIPED_FALLBACK_INSTANCES = [
     "https://pipedapi.astartes.nl",
     "https://api.piped.yt",
 ]
+SOUNDCLOUD_AUDIO_FORMATS = "http_aac,hls_aac,http_opus,hls_opus,http_mp3,hls_mp3"
 
 
 @dataclass
@@ -226,6 +227,83 @@ class GuildPlayer:
 
         return await asyncio.to_thread(fetch)
 
+    async def _download_from_soundcloud(self, query):
+        """Search/download a SoundCloud track without touching YouTube."""
+        parsed = urllib.parse.urlparse(query)
+        is_url = bool(parsed.netloc and "soundcloud.com" in parsed.netloc.lower())
+        target = query if is_url else f"scsearch1:{query}"
+
+        out_dir = Path(tempfile.gettempdir()) / "mcord_music"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / "sc-%(id)s.%(ext)s"
+        ffmpeg_dir = str(Path(self.config.ffmpeg_path).resolve().parent)
+        proxy = os.getenv("YOUTUBE_PROXY", "").strip()
+        user_agent = os.getenv("YOUTUBE_USER_AGENT", "").strip()
+
+        cmd = [
+            self.config.ytdlp_path,
+            "--no-playlist",
+            "--format", "bestaudio/best",
+            "--ffmpeg-location", ffmpeg_dir,
+            "--extractor-args", f"soundcloud:formats={SOUNDCLOUD_AUDIO_FORMATS}",
+            "--retries", "1",
+            "--fragment-retries", "1",
+            "--socket-timeout", "12",
+            "--no-warnings",
+            "--print", "after_move:title",
+            "--print", "after_move:filepath",
+            "--output", str(out),
+        ]
+        if proxy:
+            cmd += ["--proxy", proxy]
+        if user_agent:
+            cmd += ["--user-agent", user_agent]
+        cmd.append(target)
+
+        log.info("Trying SoundCloud %s", "URL" if is_url else "search")
+        p = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await p.communicate()
+
+        if p.returncode != 0:
+            error = stderr.decode("utf-8", "replace").strip()
+            raise RuntimeError(
+                "SoundCloud extraction failed: "
+                + (error[-1600:] or "unknown error")
+            )
+
+        lines = [
+            x.strip()
+            for x in stdout.decode("utf-8", "replace").splitlines()
+            if x.strip()
+        ]
+        if len(lines) < 2:
+            raise RuntimeError("SoundCloud returned no playable track.")
+
+        path = Path(lines[-1])
+        title = lines[-2]
+        if not path.exists():
+            raise RuntimeError(f"SoundCloud output file was not created: {path}")
+
+        duration = await self._media_duration(path)
+        if duration is None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise RuntimeError("SoundCloud returned invalid media.")
+
+        self.temp_files.add(path)
+        log.info(
+            "SoundCloud extraction succeeded: title=%s duration=%.2fs",
+            title,
+            duration,
+        )
+        return Track(title, path, query=query)
+
     async def _download_from_piped(self, query):
         """Resolve and download audio through Piped's own media proxy."""
         parsed = urllib.parse.urlparse(query)
@@ -411,145 +489,87 @@ class GuildPlayer:
         )
 
     async def download(self, query):
+        # SoundCloud works independently of the YouTube egress block seen on Infrlo.
+        try:
+            return await self._download_from_soundcloud(query)
+        except Exception as exc:
+            log.warning("SoundCloud extraction failed: %s", exc)
+
+        try:
+            log.info("Trying live Piped extraction.")
+            return await self._download_from_piped(query)
+        except Exception as exc:
+            log.warning("Piped extraction failed: %s", exc)
+
         d = Path(tempfile.gettempdir()) / "mcord_music"
         d.mkdir(parents=True, exist_ok=True)
         out = d / "%(id)s.%(ext)s"
         target = query if query.startswith(("http://", "https://")) else "ytsearch1:" + query
-
-        # Piped is the primary path because its media URLs are served through
-        # Piped's own proxy instead of sending the audio request directly to
-        # YouTube from the Infrlo datacenter.
-        try:
-            log.info("Trying live Piped extraction first.")
-            return await self._download_from_piped(query)
-        except Exception as exc:
-            log.warning("Live Piped extraction failed: %s", exc)
-
-        # Keep yt-dlp as a secondary path for environments where direct
-        # YouTube access happens to work. No proxy is required by default.
         ffmpeg_dir = str(Path(self.config.ffmpeg_path).resolve().parent)
+
+        cmd = [
+            self.config.ytdlp_path,
+            "--no-playlist",
+            "--format", "bestaudio/best",
+            "--ffmpeg-location", ffmpeg_dir,
+            "--retries", "1",
+            "--fragment-retries", "1",
+            "--socket-timeout", "12",
+            "--no-warnings",
+            "--print", "after_move:title",
+            "--print", "after_move:filepath",
+            "--output", str(out),
+        ]
         cookies_file = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
         cookies_b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
-
         if not cookies_file and cookies_b64:
-            generated_cookie_file = d / "youtube_cookies.txt"
             try:
-                generated_cookie_file.write_bytes(
+                cookies_file = str(d / "youtube_cookies.txt")
+                Path(cookies_file).write_bytes(
                     base64.b64decode(cookies_b64, validate=True)
                 )
-                cookies_file = str(generated_cookie_file)
                 log.info("YouTube cookies loaded from YOUTUBE_COOKIES_B64.")
             except Exception:
-                log.exception("Could not decode YOUTUBE_COOKIES_B64.")
-
-        if not cookies_file:
-            for candidate in (
-                Path("/app/Config/youtube_cookies.txt"),
-                Path("/app/youtube_cookies.txt"),
-                Path.cwd() / "Config" / "youtube_cookies.txt",
-                Path.cwd() / "youtube_cookies.txt",
-            ):
-                if candidate.is_file():
-                    cookies_file = str(candidate)
-                    break
-
+                cookies_file = ""
         if cookies_file and Path(cookies_file).is_file():
-            log.info("YouTube cookies enabled from %s", cookies_file)
-        else:
-            cookies_file = ""
+            cmd += ["--cookies", cookies_file]
 
         proxy = os.getenv("YOUTUBE_PROXY", "").strip()
         user_agent = os.getenv("YOUTUBE_USER_AGENT", "").strip()
-        errors = []
+        if proxy:
+            cmd += ["--proxy", proxy]
+        if user_agent:
+            cmd += ["--user-agent", user_agent]
+        cmd.append(target)
 
-        # A small direct fallback instead of six expensive client attempts.
-        for client in ("android_vr", None):
-            cmd = [
-                self.config.ytdlp_path,
-                "--no-playlist",
-                "--format", "bestaudio[ext=m4a]/bestaudio/best",
-                "--ffmpeg-location", ffmpeg_dir,
-                "--retries", "1",
-                "--fragment-retries", "1",
-                "--socket-timeout", "12",
-                "--no-warnings",
-                "--print", "after_move:title",
-                "--print", "after_move:filepath",
-                "--output", str(out),
-            ]
-
-            if cookies_file and Path(cookies_file).is_file():
-                cmd += ["--cookies", cookies_file]
-            if proxy:
-                cmd += ["--proxy", proxy]
-            if user_agent:
-                cmd += ["--user-agent", user_agent]
-            if client:
-                cmd += ["--extractor-args", f"youtube:player_client={client}"]
-            cmd.append(target)
-
-            log.info(
-                "Trying direct YouTube fallback client=%s cookies=%s proxy=%s",
-                client or "default",
-                bool(cookies_file),
-                bool(proxy),
+        try:
+            log.info("Trying direct YouTube fallback.")
+            p = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-
-            try:
-                p = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, stderr = await p.communicate()
-
-                if p.returncode == 0:
-                    lines = [
-                        x.strip()
-                        for x in stdout.decode("utf-8", "replace").splitlines()
-                        if x.strip()
-                    ]
-                    if len(lines) >= 2:
-                        path = Path(lines[-1])
-                        if path.exists():
-                            duration = await self._media_duration(path)
-                            if duration is not None:
-                                self.temp_files.add(path)
-                                return Track(lines[-2], path, query=query)
-                            try:
-                                path.unlink(missing_ok=True)
-                            except OSError:
-                                pass
-
-                error = stderr.decode("utf-8", "replace").strip()
-                diagnostics = [
-                    line.strip()
-                    for line in error.splitlines()
-                    if any(
-                        marker in line
-                        for marker in (
-                            "LOGIN_REQUIRED",
-                            "Sign in to confirm",
-                            "HTTP Error 403",
-                            "HTTP Error 429",
-                            "Requested format is not available",
-                            "Video unavailable",
-                            "Private video",
-                            "age-restricted",
-                            "ERROR:",
-                        )
-                    )
+            stdout, stderr = await p.communicate()
+            if p.returncode == 0:
+                lines = [
+                    x.strip() for x in stdout.decode("utf-8", "replace").splitlines()
+                    if x.strip()
                 ]
-                if diagnostics:
-                    error = "\n".join(diagnostics[-8:])
-                errors.append(f"{client or 'default'}: {error[-1000:]}")
-            except Exception as exc:
-                errors.append(f"{client or 'default'}: {exc}")
+                if len(lines) >= 2:
+                    path = Path(lines[-1])
+                    if path.exists():
+                        duration = await self._media_duration(path)
+                        if duration is not None:
+                            self.temp_files.add(path)
+                            return Track(lines[-2], path, query=query)
 
-        raise RuntimeError(
-            "پخش نشد: نتونستم صدا را از سرویس‌های فعلی دریافت کنم. "
-            + " | ".join(errors[-3:])
-        )
+            error = stderr.decode("utf-8", "replace").strip()
+            raise RuntimeError(error[-1600:] or "unknown YouTube error")
+        except Exception as exc:
+            raise RuntimeError(
+                "پخش نشد. SoundCloud، Piped و YouTube مستقیم از این سرور پاسخ قابل‌استفاده ندادند. "
+                + str(exc)
+            ) from exc
 
     async def _media_duration(self, path: Path) -> float | None:
         """Read the real media duration without blocking the Discord gateway."""
