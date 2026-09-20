@@ -68,13 +68,53 @@ class GuildPlayer:
         if self.connection is not None:
             await self._leave_connection_only()
 
-        if self.voice is None:
-            self._new_voice_client()
+        # IMPORTANT: mcord_voice/LiveKit already has its own ICE retry loop.
+        # Do not wrap voice.join() in a short asyncio.wait_for(), otherwise
+        # we cancel that internal recovery while it is still retrying.
+        last_error = None
+        for attempt in range(1, 3):
+            started = asyncio.get_running_loop().time()
+            try:
+                self._new_voice_client()
+                log.info(
+                    "Voice join attempt %s/2 guild=%s channel=%s",
+                    attempt,
+                    guild_id,
+                    channel_id,
+                )
+                self.connection = await self.voice.join(
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                )
+                elapsed = asyncio.get_running_loop().time() - started
+                log.info(
+                    "Voice connected guild=%s in %.1fs",
+                    guild_id,
+                    elapsed,
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+                elapsed = asyncio.get_running_loop().time() - started
+                log.warning(
+                    "Voice join attempt %s/2 failed after %.1fs: %s",
+                    attempt,
+                    elapsed,
+                    exc,
+                )
+                self.connection = None
+                try:
+                    if self.voice is not None:
+                        await self.voice.shutdown()
+                except Exception:
+                    log.exception("voice shutdown after failed join")
+                finally:
+                    self.voice = None
 
-        self.connection = await self.voice.join(
-            guild_id=guild_id,
-            channel_id=channel_id,
-        )
+                if attempt < 2:
+                    await asyncio.sleep(1)
+
+        raise RuntimeError(f"Voice connection failed after 2 attempts: {last_error}")
 
     async def _leave_connection_only(self):
         if self.connection is not None:
@@ -637,14 +677,11 @@ class MusicBot:
                 # Extraction happens outside the Discord interaction handler.
                 track = await player.download(query)
 
-                # Join only after the file is ready. This avoids keeping a
-                # LiveKit connection half-open while YouTube is resolving.
-                await asyncio.wait_for(
-                    player.join(
-                        guild_id,
-                        str(channel.id),
-                    ),
-                    timeout=35,
+                # Join only after the file is ready. voice.join() is
+                # allowed to finish its own LiveKit/ICE retry cycle.
+                await player.join(
+                    guild_id,
+                    str(channel.id),
                 )
 
                 track.requested_by = str(interaction.user)
@@ -652,11 +689,6 @@ class MusicBot:
 
                 await interaction.followup.send(
                     f"آهنگ {track.title} به صف اضافه شد. جایگاه: {pos}"
-                )
-            except asyncio.TimeoutError:
-                log.error("LiveKit join timed out for guild=%s", guild_id)
-                await interaction.followup.send(
-                    "اتصال Voice خیلی طول کشید و لغو شد. دوباره /play را امتحان کن."
                 )
             except Exception as exc:
                 log.exception("play failed")
