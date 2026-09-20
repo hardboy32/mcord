@@ -14,6 +14,3 @@ static-ffmpeg>=3,<4
 # Discord voice support
 PyNaCl
 davey
-
-# YouTube PO Token provider
-bgutil-ytdlp-pot-provider==2.0.0
