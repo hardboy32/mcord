@@ -16,8 +16,6 @@ from mcord_voice import VoiceClient, create_audio_resource
 log = logging.getLogger("mcord-music")
 
 # Public Piped instances provide a second YouTube extraction path.
-# If Infrlo's IP is blocked by YouTube, the bot can ask several independent
-# Piped backends for the audio stream instead of depending on a proxy.
 PIPED_INSTANCES = [
     "https://pipedapi.kavin.rocks",
     "https://pipedapi-libre.kavin.rocks",
@@ -26,15 +24,15 @@ PIPED_INSTANCES = [
     "https://pipedapi.drgns.space",
 ]
 
-# Public Invidious instances currently listed by the Invidious project.
-# Invidious can proxy the final media request (local=true), which is important:
-# otherwise a googlevideo URL generated on another server can be unusable from
-# Infrlo because YouTube may bind it to the originating IP.
+# Public Invidious instances. The last one is intentionally included as a
+# rotating fallback because public instances can temporarily rate-limit or
+# become unavailable.
 INVIDIOUS_INSTANCES = [
     "https://inv.nadeko.net",
     "https://invidious.nerdvpn.de",
     "https://yt.chocolatemoo53.com",
     "https://invidious.tiekoetter.com",
+    "https://invidious.f5.si",
 ]
 
 
@@ -54,7 +52,6 @@ class GuildPlayer:
         self.queue = []
         self.current = None
         self.temp_files = set()
-        # off = no loop, song = repeat current song, queue = repeat the queue
         self.loop_mode = "off"
         self.loop_items = []
 
@@ -107,7 +104,7 @@ class GuildPlayer:
                 pass
         self.temp_files.clear()
 
-    async def _piped_json(self, url):
+    async def _piped_json(self, url, timeout=10):
         def fetch():
             req = urllib.request.Request(
                 url,
@@ -116,7 +113,7 @@ class GuildPlayer:
                     "Accept": "application/json",
                 },
             )
-            with urllib.request.urlopen(req, timeout=12) as response:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8", "replace"))
 
         return await asyncio.to_thread(fetch)
@@ -136,92 +133,137 @@ class GuildPlayer:
             if video_id:
                 return video_id, query
 
-            params = urllib.parse.urlencode({"q": query, "type": "video", "sort_by": "relevance"})
-            data = await self._piped_json(f"{instance}/api/v1/search?{params}")
+            params = urllib.parse.urlencode({
+                "q": query,
+                "type": "video",
+                "sort_by": "relevance",
+            })
+            data = await self._piped_json(
+                f"{instance}/api/v1/search?{params}",
+                timeout=8,
+            )
             for item in data if isinstance(data, list) else []:
                 if item.get("type") == "video" and item.get("videoId"):
                     return item["videoId"], item.get("title") or query
             raise RuntimeError("Invidious returned no video search result.")
 
-        errors = []
-        for instance in INVIDIOUS_INSTANCES:
-            try:
-                vid, fallback_title = await find_video(instance)
-                data = await self._piped_json(f"{instance}/api/v1/videos/{urllib.parse.quote(vid, safe='')}")
-                formats = data.get("adaptiveFormats") or []
-                formats += data.get("audioStreams") or []
+        async def try_instance(instance):
+            vid, fallback_title = await find_video(instance)
+            data = await self._piped_json(
+                f"{instance}/api/v1/videos/{urllib.parse.quote(vid, safe='')}",
+                timeout=8,
+            )
 
-                audio = [
-                    f for f in formats
-                    if "audio/" in (f.get("type") or f.get("mimeType") or "")
-                    or (f.get("mimeType") or "").startswith("audio/")
-                ]
-                if not audio:
-                    raise RuntimeError("Invidious returned no audio stream.")
+            formats = list(data.get("adaptiveFormats") or [])
+            formats += list(data.get("audioStreams") or [])
 
-                def bitrate(fmt):
-                    try:
-                        return int(fmt.get("bitrate") or 0)
-                    except (TypeError, ValueError):
-                        return 0
+            audio = [
+                f for f in formats
+                if "audio/" in (f.get("type") or "")
+                or "audio/" in (f.get("mimeType") or "")
+            ]
+            if not audio:
+                raise RuntimeError("Invidious returned no audio stream.")
 
-                preferred = sorted(
-                    audio,
-                    key=lambda f: (
-                        0 if "audio/mp4" in (f.get("type") or f.get("mimeType") or "") else 1,
-                        -bitrate(f),
-                    ),
-                )[0]
+            def bitrate(fmt):
+                try:
+                    return int(fmt.get("bitrate") or 0)
+                except (TypeError, ValueError):
+                    return 0
 
-                itag = preferred.get("itag")
-                if not itag:
-                    raise RuntimeError("Invidious returned an audio stream without itag.")
+            preferred = sorted(
+                audio,
+                key=lambda f: (
+                    0 if "audio/mp4" in (
+                        f.get("type") or f.get("mimeType") or ""
+                    ) else 1,
+                    -bitrate(f),
+                ),
+            )[0]
 
-                # local=true tells Invidious/its companion to proxy the media
-                # instead of exposing a googlevideo URL generated for another IP.
-                stream_url = (
-                    f"{instance}/latest_version?"
-                    + urllib.parse.urlencode({
-                        "id": vid,
-                        "itag": itag,
-                        "local": "true",
-                    })
+            itag = preferred.get("itag")
+            if not itag:
+                raise RuntimeError("Invidious returned an audio stream without itag.")
+
+            # local=true makes Invidious/companion proxy the media stream, so
+            # Infrlo does not need to contact a googlevideo host directly.
+            stream_url = (
+                f"{instance}/latest_version?"
+                + urllib.parse.urlencode({
+                    "id": vid,
+                    "itag": itag,
+                    "local": "true",
+                })
+            )
+
+            out_dir = Path(tempfile.gettempdir()) / "mcord_music"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            safe_id = "".join(
+                ch for ch in vid if ch.isalnum() or ch in "-_"
+            )[:80] or "audio"
+            mime = preferred.get("type") or preferred.get("mimeType") or ""
+            suffix = ".m4a" if "audio/mp4" in mime else ".webm"
+            path = out_dir / f"invidious-{safe_id}{suffix}"
+
+            def download_file():
+                req = urllib.request.Request(
+                    stream_url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; McordMusicBot/1.0)",
+                        "Accept": "*/*",
+                    },
                 )
+                with urllib.request.urlopen(req, timeout=45) as response, open(path, "wb") as f:
+                    while True:
+                        chunk = response.read(256 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
 
-                out_dir = Path(tempfile.gettempdir()) / "mcord_music"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                safe_id = "".join(ch for ch in vid if ch.isalnum() or ch in "-_")[:80] or "audio"
-                mime = preferred.get("type") or preferred.get("mimeType") or ""
-                suffix = ".m4a" if "audio/mp4" in mime else ".webm"
-                path = out_dir / f"invidious-{safe_id}{suffix}"
+            await asyncio.to_thread(download_file)
+            if not path.exists() or path.stat().st_size < 1024:
+                raise RuntimeError("Invidious returned an empty audio file.")
 
-                def download_file():
-                    req = urllib.request.Request(
-                        stream_url,
-                        headers={
-                            "User-Agent": "Mozilla/5.0 (compatible; McordMusicBot/1.0)",
-                            "Accept": "*/*",
-                        },
-                    )
-                    with urllib.request.urlopen(req, timeout=45) as response, open(path, "wb") as f:
-                        while True:
-                            chunk = response.read(256 * 1024)
-                            if not chunk:
-                                break
-                            f.write(chunk)
+            self.temp_files.add(path)
+            return Track(
+                data.get("title") or fallback_title or "YouTube audio",
+                path,
+                query=query,
+            )
 
-                await asyncio.to_thread(download_file)
-                if not path.exists() or path.stat().st_size < 1024:
-                    raise RuntimeError("Invidious returned an empty audio file.")
+        # Try all public instances concurrently. This prevents one dead or
+        # rate-limited instance from adding 30-60 seconds of serial delay.
+        tasks = {
+            asyncio.create_task(try_instance(instance)): instance
+            for instance in INVIDIOUS_INSTANCES
+        }
+        errors = []
 
-                self.temp_files.add(path)
-                return Track(data.get("title") or fallback_title or "YouTube audio", path, query=query)
+        try:
+            while tasks:
+                done, _ = await asyncio.wait(
+                    tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    instance = tasks.pop(task)
+                    try:
+                        result = task.result()
+                        for pending in tasks:
+                            pending.cancel()
+                        if tasks:
+                            await asyncio.gather(*tasks, return_exceptions=True)
+                        return result
+                    except Exception as exc:
+                        errors.append(f"{instance}: {exc}")
+        finally:
+            for pending in tasks:
+                pending.cancel()
 
-            except Exception as exc:
-                errors.append(f"{instance}: {exc}")
-                log.warning("Invidious fallback failed on %s: %s", instance, exc)
-
-        raise RuntimeError("All Invidious fallback instances failed: " + " | ".join(errors[-4:]))
+        raise RuntimeError(
+            "All Invidious fallback instances failed: "
+            + " | ".join(errors[-5:])
+        )
 
     async def _download_from_piped(self, query):
         """Fallback YouTube resolver that does not contact YouTube directly."""
@@ -238,7 +280,7 @@ class GuildPlayer:
             if video_id:
                 return video_id, query
             params = urllib.parse.urlencode({"q": query, "filter": "videos"})
-            data = await self._piped_json(f"{instance}/search?{params}")
+            data = await self._piped_json(f"{instance}/search?{params}", timeout=8)
             items = data.get("items") or []
             for item in items:
                 if item.get("type") == "stream" and item.get("url"):
@@ -249,7 +291,10 @@ class GuildPlayer:
         for instance in PIPED_INSTANCES:
             try:
                 vid, fallback_title = await get_video_id(instance)
-                data = await self._piped_json(f"{instance}/streams/{urllib.parse.quote(vid, safe='')}")
+                data = await self._piped_json(
+                    f"{instance}/streams/{urllib.parse.quote(vid, safe='')}",
+                    timeout=10,
+                )
                 streams = data.get("audioStreams") or []
                 if not streams:
                     raise RuntimeError("Piped returned no audio streams.")
@@ -288,13 +333,19 @@ class GuildPlayer:
                     raise RuntimeError("Piped returned an empty audio file.")
 
                 self.temp_files.add(path)
-                return Track(data.get("title") or fallback_title or "YouTube audio", path, query=query)
+                return Track(
+                    data.get("title") or fallback_title or "YouTube audio",
+                    path,
+                    query=query,
+                )
 
             except Exception as exc:
                 errors.append(f"{instance}: {exc}")
                 log.warning("Piped fallback failed on %s: %s", instance, exc)
 
-        raise RuntimeError("All Piped fallback instances failed: " + " | ".join(errors[-3:]))
+        raise RuntimeError(
+            "All Piped fallback instances failed: " + " | ".join(errors[-3:])
+        )
 
     async def download(self, query):
         d = Path(tempfile.gettempdir()) / "mcord_music"
@@ -304,15 +355,14 @@ class GuildPlayer:
 
         ffmpeg_dir = str(Path(self.config.ffmpeg_path).resolve().parent)
 
-        # Cookies are useful for authenticated/browser-like clients, but YouTube
-        # can react badly when account cookies are sent to clients that do not
-        # support them. Keep them for web clients and skip them for guest clients.
         cookies_file = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
         cookies_b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
         if not cookies_file and cookies_b64:
             generated_cookie_file = d / "youtube_cookies.txt"
             try:
-                generated_cookie_file.write_bytes(base64.b64decode(cookies_b64, validate=True))
+                generated_cookie_file.write_bytes(
+                    base64.b64decode(cookies_b64, validate=True)
+                )
                 cookies_file = str(generated_cookie_file)
                 log.info("YouTube cookies loaded from YOUTUBE_COOKIES_B64.")
             except Exception:
@@ -337,9 +387,6 @@ class GuildPlayer:
         proxy = os.getenv("YOUTUBE_PROXY", "").strip()
         user_agent = os.getenv("YOUTUBE_USER_AGENT", "").strip()
 
-        # Start with clients that do not require a PO token and do not need
-        # account cookies. If YouTube rejects the datacenter IP, fall back to
-        # browser-like clients with cookies + bgutil.
         client_plans = [
             ("android_vr", False),
             ("tv", False),
@@ -369,16 +416,12 @@ class GuildPlayer:
 
             if use_cookies and cookies_file and Path(cookies_file).is_file():
                 cmd += ["--cookies", cookies_file]
-
             if proxy:
                 cmd += ["--proxy", proxy]
-
             if user_agent:
                 cmd += ["--user-agent", user_agent]
-
             if client:
                 cmd += ["--extractor-args", f"youtube:player_client={client}"]
-
             if self.config.bgutil_path:
                 cmd += [
                     "--extractor-args",
@@ -438,16 +481,12 @@ class GuildPlayer:
 
             errors.append(f"{client or 'default'}: {error[-1200:]}")
 
-        # Second path: Invidious can proxy the media request itself. This
-        # avoids handing Infrlo a googlevideo URL that may be bound to another IP.
         try:
             log.warning("Direct YouTube extraction failed; trying Invidious proxy fallback.")
             return await self._download_from_invidious(query)
         except Exception as invidious_exc:
             errors.append(f"invidious-fallback: {invidious_exc}")
 
-        # Third path: independent Piped backends. Some instances may return
-        # direct googlevideo URLs, so this is intentionally after Invidious.
         try:
             log.warning("Invidious fallback failed; trying Piped fallback.")
             return await self._download_from_piped(query)
@@ -461,16 +500,16 @@ class GuildPlayer:
                 "The bot tried Invidious proxying and public Piped fallbacks too."
             )
 
-        raise RuntimeError("YouTube extraction failed." + hint + " " + " | ".join(errors[-6:]))
+        raise RuntimeError(
+            "YouTube extraction failed." + hint + " " + " | ".join(errors[-6:])
+        )
+
     async def play_next(self):
         if self.connection is None:
             return
 
         if not self.queue:
             if self.loop_mode == "queue" and self.loop_items:
-                # Rebuild the same playlist by downloading each saved query again.
-                # This keeps disk usage low and makes loop-all work even after
-                # previous temporary files have been deleted.
                 for item in self.loop_items:
                     try:
                         self.queue.append(await self.download(item))
@@ -497,7 +536,6 @@ class GuildPlayer:
                 pass
             self.temp_files.discard(t.path)
 
-            # Repeat one track by resolving/downloading it again after playback.
             if self.loop_mode == "song" and t.query:
                 try:
                     self.queue.insert(0, await self.download(t.query))
@@ -511,9 +549,6 @@ class GuildPlayer:
 
     async def add(self, t):
         self.queue.append(t)
-
-        # Keep the requested queue as the playlist for loop-all.
-        # Avoid duplicates when the same track is already represented.
         if self.loop_mode == "queue":
             self.loop_items.append(t.query)
 
@@ -529,9 +564,7 @@ class GuildPlayer:
         if mode == "off":
             self.loop_items.clear()
         elif mode == "queue":
-            # Current queued items become the repeat playlist.
             self.loop_items = [t.query for t in self.queue if t.query]
-
         return self.loop_mode
 
     async def stop(self):
@@ -591,8 +624,8 @@ class MusicBot:
                 )
                 try:
                     track = await player.download(query)
-                    track.requested_by = str(interaction.user)
                     await join_task
+                    track.requested_by = str(interaction.user)
                 except Exception:
                     if not join_task.done():
                         join_task.cancel()
