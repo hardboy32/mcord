@@ -831,31 +831,21 @@ class MusicBot:
         if exc:
             log.error("background play task failed: %s", exc, exc_info=exc)
 
-    async def _delete_after_delay(self, message, delay: float = 10.0):
-        """Delete one bot message after a short delay."""
-        try:
-            await asyncio.sleep(delay)
-            await message.delete()
-        except (discord.NotFound, discord.HTTPException, discord.Forbidden):
-            pass
-        except Exception:
-            log.exception("Could not auto-delete bot message.")
-
     async def _temp_followup(self, interaction, content: str):
-        """Send a follow-up message and remove it automatically."""
-        message = await interaction.followup.send(content, wait=True)
-        asyncio.create_task(self._delete_after_delay(message))
-        return message
+        """Send a bot message that Discord deletes automatically after 10s."""
+        return await interaction.followup.send(
+            content,
+            wait=True,
+            delete_after=10,
+        )
 
     async def _temp_response(self, interaction, content: str, **kwargs):
-        """Send an initial interaction response and remove it automatically."""
-        await interaction.response.send_message(content, **kwargs)
-        try:
-            message = await interaction.original_response()
-            asyncio.create_task(self._delete_after_delay(message))
-        except (discord.NotFound, discord.HTTPException):
-            pass
-        return message if "message" in locals() else None
+        """Send an interaction response that Discord deletes automatically after 10s."""
+        return await interaction.response.send_message(
+            content,
+            delete_after=10,
+            **kwargs,
+        )
 
     def register(self):
         @self.bot.tree.command(name="play", description="پخش آهنگ از نام یا لینک")
