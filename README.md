@@ -12,11 +12,13 @@ Required environment variable:
 
 ## Music extraction
 
-The bot uses **Piped's live public instance list first**. Piped's current API documentation recommends dynamically parsing the public instance list, and its audio stream URLs are served through Piped's proxy infrastructure rather than requiring the bot to contact YouTube directly.
+The bot tries music sources in this order:
 
-The normal `/play` path therefore does not require Deno, PO Tokens, cookies, or a proxy.
+1. **SoundCloud search/direct URL** — normal song-name searches use SoundCloud first, so they do not depend on YouTube.
+2. **Piped** — used as a YouTube-compatible fallback when a public Piped instance is reachable.
+3. **yt-dlp direct YouTube** — last fallback for hosts where YouTube accepts the server IP.
 
-There is a small `yt-dlp` direct fallback for hosts where direct YouTube access happens to work.
+The normal SoundCloud path does not require Deno, PO Tokens, YouTube cookies, or a proxy.
 
 Optional variables:
 
