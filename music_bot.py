@@ -16,23 +16,19 @@ from mcord_voice import VoiceClient, create_audio_resource
 
 log = logging.getLogger("mcord-music")
 
-# Public Piped instances provide a second YouTube extraction path.
-PIPED_INSTANCES = [
+# Piped maintains a live JSON list of public API instances. The old
+# hard-coded list became stale very quickly and caused the bot to keep trying
+# dead backends. We refresh this list at runtime.
+PIPED_INSTANCES_URL = "https://piped-instances.kavin.rocks/"
+PIPED_FALLBACK_INSTANCES = [
     "https://pipedapi.kavin.rocks",
-    "https://pipedapi-libre.kavin.rocks",
-    "https://pipedapi.adminforge.de",
-    "https://pipedapi.privacy.com.de",
-    "https://pipedapi.drgns.space",
-]
-
-# Public Invidious instances. The last one is intentionally included as a
-# rotating fallback because public instances can temporarily rate-limit or
-# become unavailable.
-INVIDIOUS_INSTANCES = [
-    "https://inv.nadeko.net",
-    "https://invidious.nerdvpn.de",
-    "https://yt.chocolatemoo53.com",
-    "https://invidious.tiekoetter.com",
+    "https://pipedapi.tokhmi.xyz",
+    "https://pipedapi.moomoo.me",
+    "https://pipedapi.syncpundit.io",
+    "https://api-piped.mha.fi",
+    "https://pipedapi.leptons.xyz",
+    "https://pipedapi.astartes.nl",
+    "https://api.piped.yt",
 ]
 
 
@@ -54,6 +50,10 @@ class GuildPlayer:
         self.temp_files = set()
         self.loop_mode = "off"
         self.loop_items = []
+        # Piped's instance list changes frequently. Cache it for a short time
+        # so /play does not depend on a stale hard-coded list.
+        self._piped_instances = []
+        self._piped_instances_loaded_at = 0.0
         # Signals an explicit /skip or /stop so duration-based completion
         # detection does not hold the queue for the whole song.
         self.playback_interrupt = None
@@ -163,6 +163,53 @@ class GuildPlayer:
             return opener.open(request, timeout=timeout)
         return urllib.request.urlopen(request, timeout=timeout)
 
+    async def _get_piped_instances(self):
+        """Return a fresh, usable set of public Piped API instances."""
+        now = asyncio.get_running_loop().time()
+        if self._piped_instances and now - self._piped_instances_loaded_at < 600:
+            return list(self._piped_instances)
+
+        def fetch_instances():
+            req = urllib.request.Request(
+                PIPED_INSTANCES_URL,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; McordMusicBot/1.0)",
+                    "Accept": "application/json",
+                },
+            )
+            with self._urlopen(req, timeout=8, proxy=os.getenv("YOUTUBE_PROXY", "").strip()) as response:
+                data = json.loads(response.read().decode("utf-8", "replace"))
+
+            result = []
+            if isinstance(data, list):
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    api_url = str(item.get("api_url") or "").strip().rstrip("/")
+                    if not api_url.startswith("https://"):
+                        continue
+                    result.append((bool(item.get("cdn")), api_url))
+
+            # CDN-backed instances are generally the intended public setup.
+            result.sort(key=lambda item: (not item[0], item[1]))
+            return [url for _cdn, url in result]
+
+        try:
+            instances = await asyncio.to_thread(fetch_instances)
+        except Exception as exc:
+            log.warning("Could not refresh Piped instance list: %s", exc)
+            instances = []
+
+        merged = []
+        for url in instances + PIPED_FALLBACK_INSTANCES:
+            if url not in merged:
+                merged.append(url)
+
+        self._piped_instances = merged[:12]
+        self._piped_instances_loaded_at = now
+        log.info("Loaded %d Piped API instances.", len(self._piped_instances))
+        return list(self._piped_instances)
+
     async def _piped_json(self, url, timeout=10):
         proxy = os.getenv("YOUTUBE_PROXY", "").strip()
 
@@ -179,8 +226,8 @@ class GuildPlayer:
 
         return await asyncio.to_thread(fetch)
 
-    async def _download_from_invidious(self, query):
-        """Resolve/search on Invidious and download through its local proxy."""
+    async def _download_from_piped(self, query):
+        """Resolve and download audio through Piped's own media proxy."""
         parsed = urllib.parse.urlparse(query)
         video_id = ""
 
@@ -190,81 +237,87 @@ class GuildPlayer:
             else:
                 video_id = urllib.parse.parse_qs(parsed.query).get("v", [""])[0]
 
-        async def find_video(instance):
-            if video_id:
-                return video_id, query
-
-            params = urllib.parse.urlencode({
-                "q": query,
-                "type": "video",
-                "sort_by": "relevance",
-            })
-            data = await self._piped_json(
-                f"{instance}/api/v1/search?{params}",
-                timeout=8,
-            )
-            for item in data if isinstance(data, list) else []:
-                if item.get("type") == "video" and item.get("videoId"):
-                    return item["videoId"], item.get("title") or query
-            raise RuntimeError("Invidious returned no video search result.")
+        instances = await self._get_piped_instances()
+        if not instances:
+            raise RuntimeError("No Piped instances are available.")
 
         async def try_instance(instance):
-            vid, fallback_title = await find_video(instance)
+            fallback_title = query
+
+            if video_id:
+                vid = video_id
+            else:
+                params = urllib.parse.urlencode({
+                    "q": query,
+                    "filter": "music_songs",
+                })
+                data = await self._piped_json(
+                    f"{instance}/search?{params}",
+                    timeout=8,
+                )
+                items = data.get("items") or []
+                vid = ""
+                for item in items:
+                    if item.get("type") == "stream" and item.get("url"):
+                        raw_url = item["url"]
+                        if "v=" in raw_url:
+                            vid = raw_url.split("v=", 1)[-1].split("&", 1)[0]
+                        if not vid:
+                            vid = str(item.get("url") or "").strip().rstrip("/").split("/")[-1]
+                        fallback_title = item.get("title") or query
+                        if vid:
+                            break
+                if not vid:
+                    # Some instances ignore music_songs and return normal video
+                    # results, so retry the same search without the music filter.
+                    params = urllib.parse.urlencode({"q": query, "filter": "videos"})
+                    data = await self._piped_json(
+                        f"{instance}/search?{params}",
+                        timeout=8,
+                    )
+                    for item in data.get("items") or []:
+                        if item.get("type") == "stream":
+                            raw_url = str(item.get("url") or "")
+                            if "v=" in raw_url:
+                                vid = raw_url.split("v=", 1)[-1].split("&", 1)[0]
+                            else:
+                                vid = raw_url.rstrip("/").split("/")[-1]
+                            fallback_title = item.get("title") or query
+                            if vid:
+                                break
+
+                if not vid:
+                    raise RuntimeError("Piped returned no search result.")
+
             data = await self._piped_json(
-                f"{instance}/api/v1/videos/{urllib.parse.quote(vid, safe='')}",
-                timeout=8,
+                f"{instance}/streams/{urllib.parse.quote(vid, safe='')}",
+                timeout=10,
             )
-
-            formats = list(data.get("adaptiveFormats") or [])
-            formats += list(data.get("audioStreams") or [])
-
-            audio = [
-                f for f in formats
-                if "audio/" in (f.get("type") or "")
-                or "audio/" in (f.get("mimeType") or "")
+            streams = [
+                s for s in (data.get("audioStreams") or [])
+                if not s.get("videoOnly") and s.get("url")
             ]
-            if not audio:
-                raise RuntimeError("Invidious returned no audio stream.")
-
-            def bitrate(fmt):
-                try:
-                    return int(fmt.get("bitrate") or 0)
-                except (TypeError, ValueError):
-                    return 0
+            if not streams:
+                raise RuntimeError("Piped returned no audio stream.")
 
             preferred = sorted(
-                audio,
-                key=lambda f: (
-                    0 if "audio/mp4" in (
-                        f.get("type") or f.get("mimeType") or ""
-                    ) else 1,
-                    -bitrate(f),
+                streams,
+                key=lambda s: (
+                    0 if "audio/mp4" in (s.get("mimeType") or "") else 1,
+                    -(int(s.get("bitrate") or 0)),
                 ),
             )[0]
+            stream_url = preferred["url"]
 
-            itag = preferred.get("itag")
-            if not itag:
-                raise RuntimeError("Invidious returned an audio stream without itag.")
-
-            # local=true makes Invidious/companion proxy the media stream, so
-            # Infrlo does not need to contact a googlevideo host directly.
-            stream_url = (
-                f"{instance}/latest_version?"
-                + urllib.parse.urlencode({
-                    "id": vid,
-                    "itag": itag,
-                    "local": "true",
-                })
-            )
-
+            # Current Piped returns a pipedproxy URL here. Downloading that
+            # URL keeps the media transfer away from YouTube/googlevideo and
+            # is the important part that lets this work from datacenter hosts.
             out_dir = Path(tempfile.gettempdir()) / "mcord_music"
             out_dir.mkdir(parents=True, exist_ok=True)
-            safe_id = "".join(
-                ch for ch in vid if ch.isalnum() or ch in "-_"
-            )[:80] or "audio"
-            mime = preferred.get("type") or preferred.get("mimeType") or ""
+            safe_id = "".join(ch for ch in vid if ch.isalnum() or ch in "-_")[:80] or "audio"
+            mime = preferred.get("mimeType") or ""
             suffix = ".m4a" if "audio/mp4" in mime else ".webm"
-            path = out_dir / f"invidious-{safe_id}{suffix}"
+            path = out_dir / f"piped-{safe_id}{suffix}"
 
             def download_file():
                 req = urllib.request.Request(
@@ -274,9 +327,13 @@ class GuildPlayer:
                         "Accept": "*/*",
                     },
                 )
-                with self._urlopen(req, timeout=45, proxy=os.getenv("YOUTUBE_PROXY", "").strip()) as response, open(path, "wb") as f:
+                with self._urlopen(
+                    req,
+                    timeout=45,
+                    proxy=os.getenv("YOUTUBE_PROXY", "").strip(),
+                ) as response, open(path, "wb") as f:
                     log.info(
-                        "Invidious media response: instance=%s status=%s content_type=%s content_length=%s",
+                        "Piped media response: instance=%s status=%s content_type=%s content_length=%s",
                         instance,
                         getattr(response, "status", "?"),
                         response.headers.get("Content-Type"),
@@ -289,10 +346,10 @@ class GuildPlayer:
                         f.write(chunk)
 
             await asyncio.to_thread(download_file)
-            if not path.exists() or path.stat().st_size < 1024:
-                raise RuntimeError("Invidious returned an empty audio file.")
 
-            # Reject truncated/invalid proxy responses before playback.
+            if not path.exists() or path.stat().st_size < 1024:
+                raise RuntimeError("Piped returned an empty audio file.")
+
             duration = await self._media_duration(path)
             if duration is None:
                 size = path.stat().st_size if path.exists() else 0
@@ -301,7 +358,7 @@ class GuildPlayer:
                 except OSError:
                     pass
                 raise RuntimeError(
-                    f"Invidious returned an invalid/incomplete audio file (size={size})."
+                    f"Piped returned an invalid/incomplete audio file (size={size})."
                 )
 
             self.temp_files.add(path)
@@ -311,11 +368,12 @@ class GuildPlayer:
                 query=query,
             )
 
-        # Try all public instances concurrently. This prevents one dead or
-        # rate-limited instance from adding 30-60 seconds of serial delay.
+        # Try several live instances in parallel. This avoids getting stuck
+        # behind one dead public backend and is much faster than the old
+        # serial fallback chain.
         tasks = {
             asyncio.create_task(try_instance(instance)): instance
-            for instance in INVIDIOUS_INSTANCES
+            for instance in instances[:8]
         }
         errors = []
 
@@ -333,116 +391,17 @@ class GuildPlayer:
                             pending.cancel()
                         if tasks:
                             await asyncio.gather(*tasks, return_exceptions=True)
+                        log.info("Piped extraction succeeded via %s", instance)
                         return result
                     except Exception as exc:
                         errors.append(f"{instance}: {exc}")
+                        log.warning("Piped failed on %s: %s", instance, exc)
         finally:
             for pending in tasks:
                 pending.cancel()
 
         raise RuntimeError(
-            "All Invidious fallback instances failed: "
-            + " | ".join(errors[-5:])
-        )
-
-    async def _download_from_piped(self, query):
-        """Fallback YouTube resolver that does not contact YouTube directly."""
-        parsed = urllib.parse.urlparse(query)
-        video_id = ""
-
-        if parsed.netloc and ("youtube.com" in parsed.netloc or "youtu.be" in parsed.netloc):
-            if parsed.netloc.endswith("youtu.be"):
-                video_id = parsed.path.strip("/").split("/")[0]
-            else:
-                video_id = urllib.parse.parse_qs(parsed.query).get("v", [""])[0]
-
-        async def get_video_id(instance):
-            if video_id:
-                return video_id, query
-            params = urllib.parse.urlencode({"q": query, "filter": "videos"})
-            data = await self._piped_json(f"{instance}/search?{params}", timeout=8)
-            items = data.get("items") or []
-            for item in items:
-                if item.get("type") == "stream" and item.get("url"):
-                    return item["url"].split("v=", 1)[-1].split("&", 1)[0], item.get("title") or query
-            raise RuntimeError("Piped returned no YouTube search result.")
-
-        errors = []
-        for instance in PIPED_INSTANCES:
-            try:
-                vid, fallback_title = await get_video_id(instance)
-                data = await self._piped_json(
-                    f"{instance}/streams/{urllib.parse.quote(vid, safe='')}",
-                    timeout=10,
-                )
-                streams = data.get("audioStreams") or []
-                if not streams:
-                    raise RuntimeError("Piped returned no audio streams.")
-
-                preferred = sorted(
-                    streams,
-                    key=lambda s: (
-                        0 if "audio/mp4" in (s.get("mimeType") or "") else 1,
-                        -(s.get("bitrate") or 0),
-                    ),
-                )[0]
-                stream_url = preferred.get("url")
-                if not stream_url:
-                    raise RuntimeError("Piped returned an invalid audio URL.")
-
-                out_dir = Path(tempfile.gettempdir()) / "mcord_music"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                safe_id = "".join(ch for ch in vid if ch.isalnum() or ch in "-_")[:80] or "audio"
-                suffix = ".m4a" if "audio/mp4" in (preferred.get("mimeType") or "") else ".webm"
-                path = out_dir / f"piped-{safe_id}{suffix}"
-
-                def download_file():
-                    req = urllib.request.Request(
-                        stream_url,
-                        headers={"User-Agent": "Mozilla/5.0 (compatible; McordMusicBot/1.0)"},
-                    )
-                    with self._urlopen(req, timeout=30, proxy=os.getenv("YOUTUBE_PROXY", "").strip()) as response, open(path, "wb") as f:
-                        log.info(
-                            "Piped media response: instance=%s status=%s content_type=%s content_length=%s",
-                            instance,
-                            getattr(response, "status", "?"),
-                            response.headers.get("Content-Type"),
-                            response.headers.get("Content-Length"),
-                        )
-                        while True:
-                            chunk = response.read(256 * 1024)
-                            if not chunk:
-                                break
-                            f.write(chunk)
-
-                await asyncio.to_thread(download_file)
-                if not path.exists() or path.stat().st_size < 1024:
-                    raise RuntimeError("Piped returned an empty audio file.")
-
-                duration = await self._media_duration(path)
-                if duration is None:
-                    size = path.stat().st_size if path.exists() else 0
-                    try:
-                        path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    raise RuntimeError(
-                        f"Piped returned an invalid/incomplete audio file (size={size})."
-                    )
-
-                self.temp_files.add(path)
-                return Track(
-                    data.get("title") or fallback_title or "YouTube audio",
-                    path,
-                    query=query,
-                )
-
-            except Exception as exc:
-                errors.append(f"{instance}: {exc}")
-                log.warning("Piped fallback failed on %s: %s", instance, exc)
-
-        raise RuntimeError(
-            "All Piped fallback instances failed: " + " | ".join(errors[-3:])
+            "All live Piped instances failed: " + " | ".join(errors[-8:])
         )
 
     async def download(self, query):
@@ -451,10 +410,21 @@ class GuildPlayer:
         out = d / "%(id)s.%(ext)s"
         target = query if query.startswith(("http://", "https://")) else "ytsearch1:" + query
 
-        ffmpeg_dir = str(Path(self.config.ffmpeg_path).resolve().parent)
+        # Piped is the primary path because its media URLs are served through
+        # Piped's own proxy instead of sending the audio request directly to
+        # YouTube from the Infrlo datacenter.
+        try:
+            log.info("Trying live Piped extraction first.")
+            return await self._download_from_piped(query)
+        except Exception as exc:
+            log.warning("Live Piped extraction failed: %s", exc)
 
+        # Keep yt-dlp as a secondary path for environments where direct
+        # YouTube access happens to work. No proxy is required by default.
+        ffmpeg_dir = str(Path(self.config.ffmpeg_path).resolve().parent)
         cookies_file = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
         cookies_b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+
         if not cookies_file and cookies_b64:
             generated_cookie_file = d / "youtube_cookies.txt"
             try:
@@ -484,46 +454,25 @@ class GuildPlayer:
 
         proxy = os.getenv("YOUTUBE_PROXY", "").strip()
         user_agent = os.getenv("YOUTUBE_USER_AGENT", "").strip()
-
         errors = []
 
-        # Infrlo's datacenter IP is currently challenged by YouTube.
-        # Try the proxy resolver first instead of spending 25-35s on clients
-        # that are known to be rejected from this hosting IP.
-        try:
-            log.info("Trying Invidious proxy first.")
-            return await self._download_from_invidious(query)
-        except Exception as exc:
-            errors.append(f"invidious-first: {exc}")
-            log.warning("Invidious-first failed: %s", exc)
-
-        client_plans = [
-            ("android_vr", False),
-            ("tv", False),
-            ("web_embedded", True),
-            ("web_safari", True),
-            (None, True),
-            ("mweb", True),
-        ]
-
-        for client, use_cookies in client_plans:
+        # A small direct fallback instead of six expensive client attempts.
+        for client in ("android_vr", None):
             cmd = [
                 self.config.ytdlp_path,
                 "--no-playlist",
                 "--format", "bestaudio[ext=m4a]/bestaudio/best",
                 "--ffmpeg-location", ffmpeg_dir,
-                "--js-runtimes", f"deno:{self.config.deno_path}",
-                "--remote-components", "ejs:npm",
-                "--retries", "2",
-                "--fragment-retries", "2",
-                "--socket-timeout", "15",
+                "--retries", "1",
+                "--fragment-retries", "1",
+                "--socket-timeout", "12",
                 "--no-warnings",
                 "--print", "after_move:title",
                 "--print", "after_move:filepath",
                 "--output", str(out),
             ]
 
-            if use_cookies and cookies_file and Path(cookies_file).is_file():
+            if cookies_file and Path(cookies_file).is_file():
                 cmd += ["--cookies", cookies_file]
             if proxy:
                 cmd += ["--proxy", proxy]
@@ -531,98 +480,70 @@ class GuildPlayer:
                 cmd += ["--user-agent", user_agent]
             if client:
                 cmd += ["--extractor-args", f"youtube:player_client={client}"]
-            if self.config.bgutil_path:
-                cmd += [
-                    "--extractor-args",
-                    "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
-                ]
-
             cmd.append(target)
 
             log.info(
-                "Trying YouTube client=%s cookies=%s proxy=%s",
+                "Trying direct YouTube fallback client=%s cookies=%s proxy=%s",
                 client or "default",
-                bool(use_cookies and cookies_file),
+                bool(cookies_file),
                 bool(proxy),
             )
 
-            p = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await p.communicate()
-
-            if p.returncode == 0:
-                lines = [
-                    x.strip()
-                    for x in stdout.decode("utf-8", "replace").splitlines()
-                    if x.strip()
-                ]
-                if len(lines) >= 2:
-                    path = Path(lines[-1])
-                    if path.exists():
-                        duration = await self._media_duration(path)
-                        if duration is not None:
-                            self.temp_files.add(path)
-                            return Track(lines[-2], path, query=query)
-
-                        log.warning(
-                            "yt-dlp reported success but produced an invalid media file: %s",
-                            path,
-                        )
-                        try:
-                            path.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-
-            error = stderr.decode("utf-8", "replace").strip()
-            diagnostics = [
-                line.strip()
-                for line in error.splitlines()
-                if any(
-                    marker in line
-                    for marker in (
-                        "LOGIN_REQUIRED",
-                        "Sign in to confirm",
-                        "HTTP Error 403",
-                        "HTTP Error 429",
-                        "playability status",
-                        "Requested format is not available",
-                        "Video unavailable",
-                        "Private video",
-                        "age-restricted",
-                        "ERROR:",
-                    )
+            try:
+                p = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-            ]
-            if diagnostics:
-                error = "\n".join(diagnostics[-10:])
+                stdout, stderr = await p.communicate()
 
-            errors.append(f"{client or 'default'}: {error[-1200:]}")
+                if p.returncode == 0:
+                    lines = [
+                        x.strip()
+                        for x in stdout.decode("utf-8", "replace").splitlines()
+                        if x.strip()
+                    ]
+                    if len(lines) >= 2:
+                        path = Path(lines[-1])
+                        if path.exists():
+                            duration = await self._media_duration(path)
+                            if duration is not None:
+                                self.temp_files.add(path)
+                                return Track(lines[-2], path, query=query)
+                            try:
+                                path.unlink(missing_ok=True)
+                            except OSError:
+                                pass
 
-        try:
-            log.warning("Direct YouTube extraction also failed; trying Invidious again.")
-            return await self._download_from_invidious(query)
-        except Exception as invidious_exc:
-            errors.append(f"invidious-fallback: {invidious_exc}")
-
-        try:
-            log.warning("Invidious failed; trying Piped fallback.")
-            return await self._download_from_piped(query)
-        except Exception as piped_exc:
-            errors.append(f"piped-fallback: {piped_exc}")
-
-        hint = ""
-        if any("LOGIN_REQUIRED" in e or "Sign in to confirm" in e for e in errors):
-            hint = (
-                " YouTube is rejecting the hosting IP. "
-                "The bot tried Invidious proxying and public Piped fallbacks too."
-                " A working HTTP/HTTPS proxy in YOUTUBE_PROXY is required if the hosting IP remains blocked."
-            )
+                error = stderr.decode("utf-8", "replace").strip()
+                diagnostics = [
+                    line.strip()
+                    for line in error.splitlines()
+                    if any(
+                        marker in line
+                        for marker in (
+                            "LOGIN_REQUIRED",
+                            "Sign in to confirm",
+                            "HTTP Error 403",
+                            "HTTP Error 429",
+                            "Requested format is not available",
+                            "Video unavailable",
+                            "Private video",
+                            "age-restricted",
+                            "ERROR:",
+                        )
+                    )
+                ]
+                if diagnostics:
+                    error = "
+".join(diagnostics[-8:])
+                errors.append(f"{client or 'default'}: {error[-1000:]}")
+            except Exception as exc:
+                errors.append(f"{client or 'default'}: {exc}")
 
         raise RuntimeError(
-            "YouTube extraction failed." + hint + " " + " | ".join(errors[-6:])
+            "پخش نشد: نتونستم صدا را از سرویس‌های فعلی دریافت کنم. "
+            + " | ".join(errors[-3:])
         )
 
     async def _media_duration(self, path: Path) -> float | None:
