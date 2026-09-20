@@ -300,11 +300,17 @@ class GuildPlayer:
             if not streams:
                 raise RuntimeError("Piped returned no audio stream.")
 
+            def bitrate(stream):
+                try:
+                    return int(stream.get("bitrate") or 0)
+                except (TypeError, ValueError):
+                    return 0
+
             preferred = sorted(
                 streams,
                 key=lambda s: (
                     0 if "audio/mp4" in (s.get("mimeType") or "") else 1,
-                    -(int(s.get("bitrate") or 0)),
+                    -bitrate(s),
                 ),
             )[0]
             stream_url = preferred["url"]
