@@ -584,6 +584,15 @@ class GuildPlayer:
             log.info("Audio resource ready: title=%s", t.title)
             await self.connection.play(resource)
             log.info("Audio playback started: title=%s", t.title)
+
+            # mcord_voice starts playback asynchronously. On a fresh voice
+            # connection, wait_until_idle() can observe the connection before
+            # the player has switched to the playing state and return
+            # immediately. If we delete the source file at that point, FFmpeg
+            # loses its input and the song stops after a few milliseconds.
+            # Give the playback worker a moment to enter the playing state
+            # before waiting for the real idle transition.
+            await asyncio.sleep(0.5)
             await self.connection.wait_until_idle()
             log.info("Audio playback finished: title=%s", t.title)
         finally:
