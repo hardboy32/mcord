@@ -777,13 +777,15 @@ class MusicBot:
         )
 
         if channel is None:
-            return await interaction.followup.send(
+            return await self._temp_followup(
+                interaction,
                 "اول وارد Voice Channel شو."
             )
 
         lock = self.play_lock(guild_id)
         if lock.locked():
-            return await interaction.followup.send(
+            return await self._temp_followup(
+                interaction,
                 "یک آهنگ دیگر در حال آماده‌سازی است؛ چند لحظه صبر کن."
             )
 
@@ -805,16 +807,18 @@ class MusicBot:
 
                 log.info("Track queued successfully: title=%s position=%s", track.title, pos)
                 try:
-                    await interaction.followup.send(
-                        f"آهنگ {track.title} به صف اضافه شد. جایگاه: {pos}"
+                    await self._temp_followup(
+                        interaction,
+                        f"آهنگ {track.title} به صف اضافه شد. جایگاه: {pos}",
                     )
                 except (discord.NotFound, discord.HTTPException) as send_exc:
                     log.warning("Could not send play success message: %s", send_exc)
             except Exception as exc:
                 log.exception("play failed")
                 try:
-                    await interaction.followup.send(
-                        f"پخش نشد: {str(exc)[:700]}"
+                    await self._temp_followup(
+                        interaction,
+                        f"پخش نشد: {str(exc)[:700]}",
                     )
                 except (discord.NotFound, discord.HTTPException) as send_exc:
                     log.warning("Could not send play error message: %s", send_exc)
@@ -826,6 +830,32 @@ class MusicBot:
         exc = task.exception()
         if exc:
             log.error("background play task failed: %s", exc, exc_info=exc)
+
+    async def _delete_after_delay(self, message, delay: float = 10.0):
+        """Delete one bot message after a short delay."""
+        try:
+            await asyncio.sleep(delay)
+            await message.delete()
+        except (discord.NotFound, discord.HTTPException, discord.Forbidden):
+            pass
+        except Exception:
+            log.exception("Could not auto-delete bot message.")
+
+    async def _temp_followup(self, interaction, content: str):
+        """Send a follow-up message and remove it automatically."""
+        message = await interaction.followup.send(content, wait=True)
+        asyncio.create_task(self._delete_after_delay(message))
+        return message
+
+    async def _temp_response(self, interaction, content: str, **kwargs):
+        """Send an initial interaction response and remove it automatically."""
+        await interaction.response.send_message(content, **kwargs)
+        try:
+            message = await interaction.original_response()
+            asyncio.create_task(self._delete_after_delay(message))
+        except (discord.NotFound, discord.HTTPException):
+            pass
+        return message if "message" in locals() else None
 
     def register(self):
         @self.bot.tree.command(name="play", description="پخش آهنگ از نام یا لینک")
@@ -853,8 +883,9 @@ class MusicBot:
         ])
         async def loop(interaction: discord.Interaction, mode: str):
             if interaction.guild is None:
-                return await interaction.response.send_message(
-                    "این دستور فقط داخل سرور قابل استفاده است."
+                return await self._temp_response(
+                    interaction,
+                    "این دستور فقط داخل سرور قابل استفاده است.",
                 )
 
             player = self.player(str(interaction.guild.id))
@@ -865,7 +896,10 @@ class MusicBot:
                 "song": "تکرار همین آهنگ فعال شد.",
                 "queue": "تکرار کل صف فعال شد.",
             }
-            await interaction.response.send_message(f"🔁 {labels[mode]}")
+            await self._temp_response(
+                interaction,
+                f"🔁 {labels[mode]}",
+            )
 
         @self.bot.tree.command(name="skip", description="آهنگ بعدی")
         async def skip(interaction):
@@ -873,13 +907,19 @@ class MusicBot:
             player = self.player(str(interaction.guild.id))
 
             if player.connection is None:
-                return await interaction.followup.send("چیزی در حال پخش نیست.")
+                return await self._temp_followup(
+                interaction,
+                "چیزی در حال پخش نیست.",
+            )
 
             if player.playback_interrupt is not None:
                 player.playback_interrupt.set()
 
             await player.connection.stop()
-            await interaction.followup.send("رفتن به آهنگ بعدی.")
+            await self._temp_followup(
+            interaction,
+            "رفتن به آهنگ بعدی.",
+        )
 
         @self.bot.tree.command(name="stop", description="توقف و خروج از Voice")
         async def stop(interaction):
@@ -887,7 +927,10 @@ class MusicBot:
             player = self.player(str(interaction.guild.id))
             await player.stop()
             await player.leave()
-            await interaction.followup.send("پخش متوقف شد و از Voice خارج شدم.")
+            await self._temp_followup(
+            interaction,
+            "پخش متوقف شد و از Voice خارج شدم.",
+        )
 
         @self.bot.tree.command(name="queue", description="نمایش صف")
         async def queue(interaction):
@@ -909,13 +952,22 @@ class MusicBot:
             if player.connection is None:
                 return await interaction.followup.send("چیزی در حال پخش نیست.")
             await player.connection.pause()
-            await interaction.followup.send("پخش مکث شد.")
+            await self._temp_followup(
+            interaction,
+            "پخش مکث شد.",
+        )
 
         @self.bot.tree.command(name="resume", description="ادامه پخش")
         async def resume(interaction):
             await interaction.response.defer()
             player = self.player(str(interaction.guild.id))
             if player.connection is None:
-                return await interaction.followup.send("چیزی برای ادامه نیست.")
+                return await self._temp_followup(
+                interaction,
+                "چیزی برای ادامه نیست.",
+            )
             await player.connection.resume()
-            await interaction.followup.send("پخش ادامه پیدا کرد.")
+            await self._temp_followup(
+            interaction,
+            "پخش ادامه پیدا کرد.",
+        )
