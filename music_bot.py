@@ -262,6 +262,13 @@ class GuildPlayer:
                     },
                 )
                 with urllib.request.urlopen(req, timeout=45) as response, open(path, "wb") as f:
+                    log.info(
+                        "Invidious media response: instance=%s status=%s content_type=%s content_length=%s",
+                        instance,
+                        getattr(response, "status", "?"),
+                        response.headers.get("Content-Type"),
+                        response.headers.get("Content-Length"),
+                    )
                     while True:
                         chunk = response.read(256 * 1024)
                         if not chunk:
@@ -271,6 +278,18 @@ class GuildPlayer:
             await asyncio.to_thread(download_file)
             if not path.exists() or path.stat().st_size < 1024:
                 raise RuntimeError("Invidious returned an empty audio file.")
+
+            # Reject truncated/invalid proxy responses before playback.
+            duration = await self._media_duration(path)
+            if duration is None:
+                size = path.stat().st_size if path.exists() else 0
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    f"Invidious returned an invalid/incomplete audio file (size={size})."
+                )
 
             self.temp_files.add(path)
             return Track(
@@ -370,6 +389,13 @@ class GuildPlayer:
                         headers={"User-Agent": "Mozilla/5.0 (compatible; McordMusicBot/1.0)"},
                     )
                     with urllib.request.urlopen(req, timeout=30) as response, open(path, "wb") as f:
+                        log.info(
+                            "Piped media response: instance=%s status=%s content_type=%s content_length=%s",
+                            instance,
+                            getattr(response, "status", "?"),
+                            response.headers.get("Content-Type"),
+                            response.headers.get("Content-Length"),
+                        )
                         while True:
                             chunk = response.read(256 * 1024)
                             if not chunk:
@@ -379,6 +405,17 @@ class GuildPlayer:
                 await asyncio.to_thread(download_file)
                 if not path.exists() or path.stat().st_size < 1024:
                     raise RuntimeError("Piped returned an empty audio file.")
+
+                duration = await self._media_duration(path)
+                if duration is None:
+                    size = path.stat().st_size if path.exists() else 0
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise RuntimeError(
+                        f"Piped returned an invalid/incomplete audio file (size={size})."
+                    )
 
                 self.temp_files.add(path)
                 return Track(
@@ -512,8 +549,19 @@ class GuildPlayer:
                 if len(lines) >= 2:
                     path = Path(lines[-1])
                     if path.exists():
-                        self.temp_files.add(path)
-                        return Track(lines[-2], path, query=query)
+                        duration = await self._media_duration(path)
+                        if duration is not None:
+                            self.temp_files.add(path)
+                            return Track(lines[-2], path, query=query)
+
+                        log.warning(
+                            "yt-dlp reported success but produced an invalid media file: %s",
+                            path,
+                        )
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
 
             error = stderr.decode("utf-8", "replace").strip()
             diagnostics = [
