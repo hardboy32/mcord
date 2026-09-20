@@ -151,7 +151,21 @@ class GuildPlayer:
                 pass
         self.temp_files.clear()
 
+    def _urlopen(self, request, timeout, proxy=""):
+        # urllib does not automatically use YOUTUBE_PROXY just because yt-dlp
+        # receives --proxy. Keep the HTTP fallbacks on the same egress IP.
+        if proxy:
+            handler = urllib.request.ProxyHandler({
+                "http": proxy,
+                "https": proxy,
+            })
+            opener = urllib.request.build_opener(handler)
+            return opener.open(request, timeout=timeout)
+        return urllib.request.urlopen(request, timeout=timeout)
+
     async def _piped_json(self, url, timeout=10):
+        proxy = os.getenv("YOUTUBE_PROXY", "").strip()
+
         def fetch():
             req = urllib.request.Request(
                 url,
@@ -160,7 +174,7 @@ class GuildPlayer:
                     "Accept": "application/json",
                 },
             )
-            with urllib.request.urlopen(req, timeout=timeout) as response:
+            with self._urlopen(req, timeout=timeout, proxy=proxy) as response:
                 return json.loads(response.read().decode("utf-8", "replace"))
 
         return await asyncio.to_thread(fetch)
@@ -260,7 +274,7 @@ class GuildPlayer:
                         "Accept": "*/*",
                     },
                 )
-                with urllib.request.urlopen(req, timeout=45) as response, open(path, "wb") as f:
+                with self._urlopen(req, timeout=45, proxy=os.getenv("YOUTUBE_PROXY", "").strip()) as response, open(path, "wb") as f:
                     log.info(
                         "Invidious media response: instance=%s status=%s content_type=%s content_length=%s",
                         instance,
@@ -387,7 +401,7 @@ class GuildPlayer:
                         stream_url,
                         headers={"User-Agent": "Mozilla/5.0 (compatible; McordMusicBot/1.0)"},
                     )
-                    with urllib.request.urlopen(req, timeout=30) as response, open(path, "wb") as f:
+                    with self._urlopen(req, timeout=30, proxy=os.getenv("YOUTUBE_PROXY", "").strip()) as response, open(path, "wb") as f:
                         log.info(
                             "Piped media response: instance=%s status=%s content_type=%s content_length=%s",
                             instance,
