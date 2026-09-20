@@ -13,4 +13,7 @@ static-ffmpeg>=3,<4
 
 # Discord voice support
 PyNaCl
+
+# Faster asyncio event loop on Linux hosts
+uvloop>=0.21,<1
 davey
