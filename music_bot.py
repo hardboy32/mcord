@@ -387,6 +387,18 @@ class GuildPlayer:
         proxy = os.getenv("YOUTUBE_PROXY", "").strip()
         user_agent = os.getenv("YOUTUBE_USER_AGENT", "").strip()
 
+        errors = []
+
+        # Infrlo's datacenter IP is currently challenged by YouTube.
+        # Try the proxy resolver first instead of spending 25-35s on clients
+        # that are known to be rejected from this hosting IP.
+        try:
+            log.info("Trying Invidious proxy first.")
+            return await self._download_from_invidious(query)
+        except Exception as exc:
+            errors.append(f"invidious-first: {exc}")
+            log.warning("Invidious-first failed: %s", exc)
+
         client_plans = [
             ("android_vr", False),
             ("tv", False),
@@ -395,7 +407,6 @@ class GuildPlayer:
             (None, True),
             ("mweb", True),
         ]
-        errors = []
 
         for client, use_cookies in client_plans:
             cmd = [
@@ -482,13 +493,13 @@ class GuildPlayer:
             errors.append(f"{client or 'default'}: {error[-1200:]}")
 
         try:
-            log.warning("Direct YouTube extraction failed; trying Invidious proxy fallback.")
+            log.warning("Direct YouTube extraction also failed; trying Invidious again.")
             return await self._download_from_invidious(query)
         except Exception as invidious_exc:
             errors.append(f"invidious-fallback: {invidious_exc}")
 
         try:
-            log.warning("Invidious fallback failed; trying Piped fallback.")
+            log.warning("Invidious failed; trying Piped fallback.")
             return await self._download_from_piped(query)
         except Exception as piped_exc:
             errors.append(f"piped-fallback: {piped_exc}")
@@ -616,20 +627,14 @@ class MusicBot:
             player = self.player(str(interaction.guild.id))
 
             try:
-                join_task = asyncio.create_task(
-                    player.join(
-                        str(interaction.guild.id),
-                        str(channel.id),
-                    )
+                # Do not start LiveKit while the external resolver is working.
+                # This avoids voice reconnect storms and reduces gateway lag.
+                track = await player.download(query)
+                await player.join(
+                    str(interaction.guild.id),
+                    str(channel.id),
                 )
-                try:
-                    track = await player.download(query)
-                    await join_task
-                    track.requested_by = str(interaction.user)
-                except Exception:
-                    if not join_task.done():
-                        join_task.cancel()
-                    raise
+                track.requested_by = str(interaction.user)
 
                 pos = await player.add(track)
                 await interaction.followup.send(
