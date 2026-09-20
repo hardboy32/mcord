@@ -26,6 +26,17 @@ PIPED_INSTANCES = [
     "https://pipedapi.drgns.space",
 ]
 
+# Public Invidious instances currently listed by the Invidious project.
+# Invidious can proxy the final media request (local=true), which is important:
+# otherwise a googlevideo URL generated on another server can be unusable from
+# Infrlo because YouTube may bind it to the originating IP.
+INVIDIOUS_INSTANCES = [
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://yt.chocolatemoo53.com",
+    "https://invidious.tiekoetter.com",
+]
+
 
 @dataclass
 class Track:
@@ -109,6 +120,108 @@ class GuildPlayer:
                 return json.loads(response.read().decode("utf-8", "replace"))
 
         return await asyncio.to_thread(fetch)
+
+    async def _download_from_invidious(self, query):
+        """Resolve/search on Invidious and download through its local proxy."""
+        parsed = urllib.parse.urlparse(query)
+        video_id = ""
+
+        if parsed.netloc and ("youtube.com" in parsed.netloc or "youtu.be" in parsed.netloc):
+            if parsed.netloc.endswith("youtu.be"):
+                video_id = parsed.path.strip("/").split("/")[0]
+            else:
+                video_id = urllib.parse.parse_qs(parsed.query).get("v", [""])[0]
+
+        async def find_video(instance):
+            if video_id:
+                return video_id, query
+
+            params = urllib.parse.urlencode({"q": query, "type": "video", "sort_by": "relevance"})
+            data = await self._piped_json(f"{instance}/api/v1/search?{params}")
+            for item in data if isinstance(data, list) else []:
+                if item.get("type") == "video" and item.get("videoId"):
+                    return item["videoId"], item.get("title") or query
+            raise RuntimeError("Invidious returned no video search result.")
+
+        errors = []
+        for instance in INVIDIOUS_INSTANCES:
+            try:
+                vid, fallback_title = await find_video(instance)
+                data = await self._piped_json(f"{instance}/api/v1/videos/{urllib.parse.quote(vid, safe='')}")
+                formats = data.get("adaptiveFormats") or []
+                formats += data.get("audioStreams") or []
+
+                audio = [
+                    f for f in formats
+                    if "audio/" in (f.get("type") or f.get("mimeType") or "")
+                    or (f.get("mimeType") or "").startswith("audio/")
+                ]
+                if not audio:
+                    raise RuntimeError("Invidious returned no audio stream.")
+
+                def bitrate(fmt):
+                    try:
+                        return int(fmt.get("bitrate") or 0)
+                    except (TypeError, ValueError):
+                        return 0
+
+                preferred = sorted(
+                    audio,
+                    key=lambda f: (
+                        0 if "audio/mp4" in (f.get("type") or f.get("mimeType") or "") else 1,
+                        -bitrate(f),
+                    ),
+                )[0]
+
+                itag = preferred.get("itag")
+                if not itag:
+                    raise RuntimeError("Invidious returned an audio stream without itag.")
+
+                # local=true tells Invidious/its companion to proxy the media
+                # instead of exposing a googlevideo URL generated for another IP.
+                stream_url = (
+                    f"{instance}/latest_version?"
+                    + urllib.parse.urlencode({
+                        "id": vid,
+                        "itag": itag,
+                        "local": "true",
+                    })
+                )
+
+                out_dir = Path(tempfile.gettempdir()) / "mcord_music"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                safe_id = "".join(ch for ch in vid if ch.isalnum() or ch in "-_")[:80] or "audio"
+                mime = preferred.get("type") or preferred.get("mimeType") or ""
+                suffix = ".m4a" if "audio/mp4" in mime else ".webm"
+                path = out_dir / f"invidious-{safe_id}{suffix}"
+
+                def download_file():
+                    req = urllib.request.Request(
+                        stream_url,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (compatible; McordMusicBot/1.0)",
+                            "Accept": "*/*",
+                        },
+                    )
+                    with urllib.request.urlopen(req, timeout=45) as response, open(path, "wb") as f:
+                        while True:
+                            chunk = response.read(256 * 1024)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+
+                await asyncio.to_thread(download_file)
+                if not path.exists() or path.stat().st_size < 1024:
+                    raise RuntimeError("Invidious returned an empty audio file.")
+
+                self.temp_files.add(path)
+                return Track(data.get("title") or fallback_title or "YouTube audio", path, query=query)
+
+            except Exception as exc:
+                errors.append(f"{instance}: {exc}")
+                log.warning("Invidious fallback failed on %s: %s", instance, exc)
+
+        raise RuntimeError("All Invidious fallback instances failed: " + " | ".join(errors[-4:]))
 
     async def _download_from_piped(self, query):
         """Fallback YouTube resolver that does not contact YouTube directly."""
@@ -325,10 +438,18 @@ class GuildPlayer:
 
             errors.append(f"{client or 'default'}: {error[-1200:]}")
 
-        # Last resort: use independent Piped backends. This is intentionally
-        # after normal yt-dlp so working direct extraction stays fast.
+        # Second path: Invidious can proxy the media request itself. This
+        # avoids handing Infrlo a googlevideo URL that may be bound to another IP.
         try:
-            log.warning("Direct YouTube extraction failed; trying Piped fallback.")
+            log.warning("Direct YouTube extraction failed; trying Invidious proxy fallback.")
+            return await self._download_from_invidious(query)
+        except Exception as invidious_exc:
+            errors.append(f"invidious-fallback: {invidious_exc}")
+
+        # Third path: independent Piped backends. Some instances may return
+        # direct googlevideo URLs, so this is intentionally after Invidious.
+        try:
+            log.warning("Invidious fallback failed; trying Piped fallback.")
             return await self._download_from_piped(query)
         except Exception as piped_exc:
             errors.append(f"piped-fallback: {piped_exc}")
@@ -337,10 +458,10 @@ class GuildPlayer:
         if any("LOGIN_REQUIRED" in e or "Sign in to confirm" in e for e in errors):
             hint = (
                 " YouTube is rejecting the hosting IP. "
-                "The bot also tried the public Piped fallback."
+                "The bot tried Invidious proxying and public Piped fallbacks too."
             )
 
-        raise RuntimeError("YouTube extraction failed." + hint + " " + " | ".join(errors[-5:]))
+        raise RuntimeError("YouTube extraction failed." + hint + " " + " | ".join(errors[-6:]))
     async def play_next(self):
         if self.connection is None:
             return
