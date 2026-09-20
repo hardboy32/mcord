@@ -574,7 +574,8 @@ class GuildPlayer:
         self.current = t
 
         try:
-            resource = create_audio_resource(
+            resource = await asyncio.to_thread(
+                create_audio_resource,
                 str(t.path),
                 ffmpeg_path=self.config.ffmpeg_path,
             )
