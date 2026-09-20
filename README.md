@@ -12,7 +12,7 @@ Required environment variable:
 
 ## Music extraction
 
-The bot uses **Piped's live public instance list first**. Piped's current API documentation recommends dynamically parsing the public instance list, and its audio stream URLs are served through Piped's proxy infrastructure rather than requiring the bot to contact YouTube directly. citeturn544288view0
+The bot uses **Piped's live public instance list first**. Piped's current API documentation recommends dynamically parsing the public instance list, and its audio stream URLs are served through Piped's proxy infrastructure rather than requiring the bot to contact YouTube directly.
 
 The normal `/play` path therefore does not require Deno, PO Tokens, cookies, or a proxy.
 
