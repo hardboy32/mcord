@@ -4,6 +4,9 @@ import base64
 import logging
 import os
 import tempfile
+import json
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from dataclasses import dataclass
 import discord
@@ -11,6 +14,17 @@ from discord import app_commands
 from mcord_voice import VoiceClient, create_audio_resource
 
 log = logging.getLogger("mcord-music")
+
+# Public Piped instances provide a second YouTube extraction path.
+# If Infrlo's IP is blocked by YouTube, the bot can ask several independent
+# Piped backends for the audio stream instead of depending on a proxy.
+PIPED_INSTANCES = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi-libre.kavin.rocks",
+    "https://pipedapi.adminforge.de",
+    "https://pipedapi.privacy.com.de",
+    "https://pipedapi.drgns.space",
+]
 
 
 @dataclass
@@ -81,6 +95,93 @@ class GuildPlayer:
             except OSError:
                 pass
         self.temp_files.clear()
+
+    async def _piped_json(self, url):
+        def fetch():
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; McordMusicBot/1.0)",
+                    "Accept": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=12) as response:
+                return json.loads(response.read().decode("utf-8", "replace"))
+
+        return await asyncio.to_thread(fetch)
+
+    async def _download_from_piped(self, query):
+        """Fallback YouTube resolver that does not contact YouTube directly."""
+        parsed = urllib.parse.urlparse(query)
+        video_id = ""
+
+        if parsed.netloc and ("youtube.com" in parsed.netloc or "youtu.be" in parsed.netloc):
+            if parsed.netloc.endswith("youtu.be"):
+                video_id = parsed.path.strip("/").split("/")[0]
+            else:
+                video_id = urllib.parse.parse_qs(parsed.query).get("v", [""])[0]
+
+        async def get_video_id(instance):
+            if video_id:
+                return video_id, query
+            params = urllib.parse.urlencode({"q": query, "filter": "videos"})
+            data = await self._piped_json(f"{instance}/search?{params}")
+            items = data.get("items") or []
+            for item in items:
+                if item.get("type") == "stream" and item.get("url"):
+                    return item["url"].split("v=", 1)[-1].split("&", 1)[0], item.get("title") or query
+            raise RuntimeError("Piped returned no YouTube search result.")
+
+        errors = []
+        for instance in PIPED_INSTANCES:
+            try:
+                vid, fallback_title = await get_video_id(instance)
+                data = await self._piped_json(f"{instance}/streams/{urllib.parse.quote(vid, safe='')}")
+                streams = data.get("audioStreams") or []
+                if not streams:
+                    raise RuntimeError("Piped returned no audio streams.")
+
+                preferred = sorted(
+                    streams,
+                    key=lambda s: (
+                        0 if "audio/mp4" in (s.get("mimeType") or "") else 1,
+                        -(s.get("bitrate") or 0),
+                    ),
+                )[0]
+                stream_url = preferred.get("url")
+                if not stream_url:
+                    raise RuntimeError("Piped returned an invalid audio URL.")
+
+                out_dir = Path(tempfile.gettempdir()) / "mcord_music"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                safe_id = "".join(ch for ch in vid if ch.isalnum() or ch in "-_")[:80] or "audio"
+                suffix = ".m4a" if "audio/mp4" in (preferred.get("mimeType") or "") else ".webm"
+                path = out_dir / f"piped-{safe_id}{suffix}"
+
+                def download_file():
+                    req = urllib.request.Request(
+                        stream_url,
+                        headers={"User-Agent": "Mozilla/5.0 (compatible; McordMusicBot/1.0)"},
+                    )
+                    with urllib.request.urlopen(req, timeout=30) as response, open(path, "wb") as f:
+                        while True:
+                            chunk = response.read(256 * 1024)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+
+                await asyncio.to_thread(download_file)
+                if not path.exists() or path.stat().st_size < 1024:
+                    raise RuntimeError("Piped returned an empty audio file.")
+
+                self.temp_files.add(path)
+                return Track(data.get("title") or fallback_title or "YouTube audio", path, query=query)
+
+            except Exception as exc:
+                errors.append(f"{instance}: {exc}")
+                log.warning("Piped fallback failed on %s: %s", instance, exc)
+
+        raise RuntimeError("All Piped fallback instances failed: " + " | ".join(errors[-3:]))
 
     async def download(self, query):
         d = Path(tempfile.gettempdir()) / "mcord_music"
@@ -224,14 +325,22 @@ class GuildPlayer:
 
             errors.append(f"{client or 'default'}: {error[-1200:]}")
 
+        # Last resort: use independent Piped backends. This is intentionally
+        # after normal yt-dlp so working direct extraction stays fast.
+        try:
+            log.warning("Direct YouTube extraction failed; trying Piped fallback.")
+            return await self._download_from_piped(query)
+        except Exception as piped_exc:
+            errors.append(f"piped-fallback: {piped_exc}")
+
         hint = ""
         if any("LOGIN_REQUIRED" in e or "Sign in to confirm" in e for e in errors):
             hint = (
-                " YouTube is rejecting the server/IP. "
-                "If this continues, set YOUTUBE_PROXY to a clean residential/browser IP."
+                " YouTube is rejecting the hosting IP. "
+                "The bot also tried the public Piped fallback."
             )
 
-        raise RuntimeError("YouTube extraction failed." + hint + " " + " | ".join(errors))
+        raise RuntimeError("YouTube extraction failed." + hint + " " + " | ".join(errors[-5:]))
     async def play_next(self):
         if self.connection is None:
             return
