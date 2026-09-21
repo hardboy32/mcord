@@ -6,7 +6,7 @@ https://mcord.ir/downloads/sdk/mcord_discord-0.1.7-py3-none-any.whl
 https://mcord.ir/downloads/sdk/mcord_voice-0.1.2-py3-none-any.whl
 
 # Music search/download
-yt-dlp[default,curl-cffi]>=2026.1.0
+yt-dlp[default]>=2026.1.0
 
 # Portable ffmpeg + ffprobe fallback for hosts where apt packages are not available at runtime
 static-ffmpeg>=3,<4
