@@ -219,11 +219,11 @@ class GuildPlayer:
             req = urllib.request.Request(
                 PIPED_INSTANCES_URL,
                 headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; McordMusicBot/1.0)",
+                    **self._request_headers(),
                     "Accept": "application/json",
                 },
             )
-            with self._urlopen(req, timeout=8, proxy=os.getenv("YOUTUBE_PROXY", "").strip()) as response:
+            with self._urlopen(req, timeout=8, proxy=self._pick_proxy()) as response:
                 data = json.loads(response.read().decode("utf-8", "replace"))
 
             result = []
@@ -257,7 +257,6 @@ class GuildPlayer:
         return list(self._piped_instances)
 
     async def _piped_json(self, url, timeout=10):
-        proxy = os.getenv("YOUTUBE_PROXY", "").strip()
 
         def fetch():
             req = urllib.request.Request(
@@ -441,7 +440,10 @@ class GuildPlayer:
                     -bitrate(s),
                 ),
             )[0]
-            stream_url = preferred["url"]
+            stream_url = str(preferred["url"])
+            proxy_url = str(data.get("proxyUrl") or "").strip().rstrip("/")
+            if stream_url.startswith("/") and proxy_url:
+                stream_url = proxy_url + stream_url
 
             # Current Piped returns a pipedproxy URL here. Downloading that
             # URL keeps the media transfer away from YouTube/googlevideo and
@@ -711,15 +713,16 @@ class GuildPlayer:
 
         self._playback_running = True
         try:
-            # One long-lived task owns the player until the queue is empty.
-            # New /play requests only append to the queue and never create
-            # another playback loop.
+            # One long-lived task owns playback until the queue is empty.
+            # New /play requests only append to the queue.
             while self.connection is not None:
                 if not self.queue:
                     if self.loop_mode == "queue" and self.loop_items:
                         for item in self.loop_items:
                             try:
                                 self.queue.append(await self.download(item))
+                            except asyncio.CancelledError:
+                                raise
                             except Exception:
                                 log.exception("Could not reload loop item: %s", item)
 
@@ -728,7 +731,6 @@ class GuildPlayer:
 
                 t = self.queue.pop(0)
                 self.current = t
-                track_failed = False
 
                 try:
                     log.info(
@@ -744,7 +746,44 @@ class GuildPlayer:
                     log.info("Audio resource ready: title=%s", t.title)
 
                     await self.connection.play(resource)
-                    log.info("Audio playback started: title=%s", t    async def add(self, t):
+                    log.info("Audio playback started: title=%s", t.title)
+
+                    await self._wait_for_playback_end(t.path)
+                    log.info("Audio playback finished: title=%s", t.title)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # A single broken track must not terminate the whole queue.
+                    log.exception(
+                        "Track failed; continuing queue: title=%s error=%s",
+                        t.title,
+                        exc,
+                    )
+                finally:
+                    try:
+                        t.path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    self.temp_files.discard(t.path)
+
+                    if self.loop_mode == "song" and t.query:
+                        try:
+                            self.queue.insert(0, await self.download(t.query))
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            log.exception(
+                                "Could not reload looped song: %s",
+                                t.query,
+                            )
+
+                    self.current = None
+
+        finally:
+            self._playback_running = False
+            self._playback_task = None
+
+    async def add(self, t):
         self.queue.append(t)
         if self.loop_mode == "queue":
             self.loop_items.append(t.query)
