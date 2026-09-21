@@ -597,10 +597,6 @@ class GuildPlayer:
         if player_clients:
             cmd += ["--extractor-args", f"youtube:player_client={player_clients}"]
 
-        impersonate = os.getenv("YTDLP_IMPERSONATE", "").strip()
-        if impersonate:
-            cmd += ["--impersonate", impersonate]
-
         cmd.append(target)
 
         try:
