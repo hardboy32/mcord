@@ -1,6 +1,5 @@
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -11,17 +10,11 @@ API_BASE = "https://mcord.ir"
 
 
 def resolve_ffmpeg_path() -> str:
-    """Return a working ffmpeg executable, including the portable fallback."""
+    """Use the system ffmpeg installed by the hosting environment."""
     configured = os.getenv("FFMPEG_PATH", "").strip()
     if configured:
         return configured
-
-    try:
-        from static_ffmpeg import run
-        ffmpeg, _ffprobe = run.get_or_fetch_platform_executables_else_raise()
-        return str(ffmpeg)
-    except Exception:
-        return "ffmpeg"
+    return "ffmpeg"
 
 
 @dataclass(frozen=True)
