@@ -1,6 +1,10 @@
 # Environment
 python-dotenv>=1.0,<2
 
+# Discord
+# The Mcord wheel does not reliably provide the discord.py import itself.
+discord.py>=2.6,<3
+
 # Mcord SDKs
 https://mcord.ir/downloads/sdk/mcord_discord-0.1.7-py3-none-any.whl
 https://mcord.ir/downloads/sdk/mcord_voice-0.1.2-py3-none-any.whl
