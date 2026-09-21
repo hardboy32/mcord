@@ -6,6 +6,7 @@ import os
 import shutil
 import tempfile
 import json
+import random
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -32,6 +33,20 @@ PIPED_FALLBACK_INSTANCES = [
 ]
 SOUNDCLOUD_AUDIO_FORMATS = "http_aac,hls_aac,http_opus,hls_opus,http_mp3,hls_mp3"
 
+# Use a small pool of normal browser User-Agents for outbound HTTP requests.
+# YOUTUBE_USER_AGENT overrides the rotation when a fixed session UA is needed.
+BROWSER_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/18.5 Safari/605.1.15",
+]
+
+
 
 @dataclass
 class Track:
@@ -55,6 +70,8 @@ class GuildPlayer:
         # so /play does not depend on a stale hard-coded list.
         self._piped_instances = []
         self._piped_instances_loaded_at = 0.0
+        self._playback_running = False
+        self._playback_task = None
         # Signals an explicit /skip or /stop so duration-based completion
         # detection does not hold the queue for the whole song.
         self.playback_interrupt = None
@@ -152,9 +169,37 @@ class GuildPlayer:
                 pass
         self.temp_files.clear()
 
+    def _user_agent(self):
+        configured = os.getenv("YOUTUBE_USER_AGENT", "").strip()
+        return configured or random.choice(BROWSER_USER_AGENTS)
+
+    def _proxy_pool(self):
+        raw = os.getenv("YOUTUBE_PROXY", "").strip()
+        if not raw:
+            return []
+        return [
+            item.strip()
+            for item in raw.replace("\n", ",").split(",")
+            if item.strip()
+        ]
+
+    def _pick_proxy(self):
+        proxies = self._proxy_pool()
+        return random.choice(proxies) if proxies else ""
+
+    def _request_headers(self, referer=""):
+        headers = {
+            "User-Agent": self._user_agent(),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "*/*",
+        }
+        if referer:
+            headers["Referer"] = referer
+        return headers
+
     def _urlopen(self, request, timeout, proxy=""):
-        # urllib does not automatically use YOUTUBE_PROXY just because yt-dlp
-        # receives --proxy. Keep the HTTP fallbacks on the same egress IP.
+        # A comma-separated YOUTUBE_PROXY value is supported; callers may pass
+        # a selected proxy explicitly to keep one request on one egress path.
         if proxy:
             handler = urllib.request.ProxyHandler({
                 "http": proxy,
@@ -218,11 +263,11 @@ class GuildPlayer:
             req = urllib.request.Request(
                 url,
                 headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; McordMusicBot/1.0)",
+                    **self._request_headers(),
                     "Accept": "application/json",
                 },
             )
-            with self._urlopen(req, timeout=timeout, proxy=proxy) as response:
+            with self._urlopen(req, timeout=timeout, proxy=self._pick_proxy()) as response:
                 return json.loads(response.read().decode("utf-8", "replace"))
 
         return await asyncio.to_thread(fetch)
@@ -242,8 +287,8 @@ class GuildPlayer:
         out_dir.mkdir(parents=True, exist_ok=True)
         out = out_dir / "sc-%(id)s.%(ext)s"
         ffmpeg_dir = str(Path(self.config.ffmpeg_path).resolve().parent)
-        proxy = os.getenv("YOUTUBE_PROXY", "").strip()
-        user_agent = os.getenv("YOUTUBE_USER_AGENT", "").strip()
+        proxy = self._pick_proxy()
+        user_agent = self._user_agent()
 
         cmd = [
             self.config.ytdlp_path,
@@ -411,15 +456,12 @@ class GuildPlayer:
             def download_file():
                 req = urllib.request.Request(
                     stream_url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (compatible; McordMusicBot/1.0)",
-                        "Accept": "*/*",
-                    },
+                    headers=self._request_headers(referer=f"{instance}/"),
                 )
                 with self._urlopen(
                     req,
                     timeout=45,
-                    proxy=os.getenv("YOUTUBE_PROXY", "").strip(),
+                    proxy=self._pick_proxy(),
                 ) as response, open(path, "wb") as f:
                     log.info(
                         "Piped media response: instance=%s status=%s content_type=%s content_length=%s",
@@ -539,12 +581,24 @@ class GuildPlayer:
         if cookies_file and Path(cookies_file).is_file():
             cmd += ["--cookies", cookies_file]
 
-        proxy = os.getenv("YOUTUBE_PROXY", "").strip()
-        user_agent = os.getenv("YOUTUBE_USER_AGENT", "").strip()
+        proxy = self._pick_proxy()
+        user_agent = self._user_agent()
+        player_clients = os.getenv(
+            "YTDLP_PLAYER_CLIENTS",
+            "android_vr,web_embedded",
+        ).strip()
+
         if proxy:
             cmd += ["--proxy", proxy]
         if user_agent:
             cmd += ["--user-agent", user_agent]
+        if player_clients:
+            cmd += ["--extractor-args", f"youtube:player_client={player_clients}"]
+
+        impersonate = os.getenv("YTDLP_IMPERSONATE", "").strip()
+        if impersonate:
+            cmd += ["--impersonate", impersonate]
+
         cmd.append(target)
 
         try:
@@ -650,78 +704,76 @@ class GuildPlayer:
                 log.exception("wait_until_idle failed after duration-based wait")
 
     async def play_next(self):
-        if self.connection is None:
-            log.warning("play_next skipped: no voice connection")
+        if self.connection is None or self._playback_running:
+            if self.connection is None:
+                log.warning("play_next skipped: no voice connection")
             return
 
-        if not self.queue:
-            if self.loop_mode == "queue" and self.loop_items:
-                for item in self.loop_items:
-                    try:
-                        self.queue.append(await self.download(item))
-                    except Exception:
-                        log.exception("Could not reload loop item: %s", item)
-
-            if not self.queue:
-                return
-
-        t = self.queue.pop(0)
-        self.current = t
-
+        self._playback_running = True
         try:
-            log.info("Preparing audio resource: title=%s path=%s", t.title, t.path)
-            resource = await asyncio.to_thread(
-                create_audio_resource,
-                str(t.path),
-                ffmpeg_path=self.config.ffmpeg_path,
-            )
-            log.info("Audio resource ready: title=%s", t.title)
-            await self.connection.play(resource)
-            log.info("Audio playback started: title=%s", t.title)
+            # One long-lived task owns the player until the queue is empty.
+            # New /play requests only append to the queue and never create
+            # another playback loop.
+            while self.connection is not None:
+                if not self.queue:
+                    if self.loop_mode == "queue" and self.loop_items:
+                        for item in self.loop_items:
+                            try:
+                                self.queue.append(await self.download(item))
+                            except Exception:
+                                log.exception("Could not reload loop item: %s", item)
 
-            await self._wait_for_playback_end(t.path)
-            log.info("Audio playback finished: title=%s", t.title)
-        finally:
-            try:
-                t.path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            self.temp_files.discard(t.path)
+                    if not self.queue:
+                        break
 
-            if self.loop_mode == "song" and t.query:
+                t = self.queue.pop(0)
+                self.current = t
+                track_failed = False
+
                 try:
-                    self.queue.insert(0, await self.download(t.query))
-                except Exception:
-                    log.exception("Could not reload looped song: %s", t.query)
+                    log.info(
+                        "Preparing audio resource: title=%s path=%s",
+                        t.title,
+                        t.path,
+                    )
+                    resource = await asyncio.to_thread(
+                        create_audio_resource,
+                        str(t.path),
+                        ffmpeg_path=self.config.ffmpeg_path,
+                    )
+                    log.info("Audio resource ready: title=%s", t.title)
 
-            self.current = None
-
-        if self.queue:
-            await self.play_next()
-
-    async def add(self, t):
+                    await self.connection.play(resource)
+                    log.info("Audio playback started: title=%s", t    async def add(self, t):
         self.queue.append(t)
         if self.loop_mode == "queue":
             self.loop_items.append(t.query)
 
         pos = len(self.queue)
 
-        if self.current is None and self.connection is not None:
-            log.info("Starting playback task: title=%s queue_position=%s", t.title, pos)
-            task = asyncio.create_task(self.play_next())
-            task.add_done_callback(self._playback_task_done)
+        if (
+            self.current is None
+            and self.connection is not None
+            and not self._playback_running
+            and (self._playback_task is None or self._playback_task.done())
+        ):
+            log.info(
+                "Starting playback task: title=%s queue_position=%s",
+                t.title,
+                pos,
+            )
+            self._playback_task = asyncio.create_task(self.play_next())
+            self._playback_task.add_done_callback(self._playback_task_done)
 
         return pos
 
-    @staticmethod
-    def _playback_task_done(task: asyncio.Task):
+    def _playback_task_done(self, task: asyncio.Task):
         if task.cancelled():
             log.warning("Playback task was cancelled.")
             return
         exc = task.exception()
         if exc:
             log.error("Playback task failed: %s", exc, exc_info=exc)
-
 
     async def set_loop(self, mode):
         self.loop_mode = mode
@@ -769,6 +821,12 @@ class MusicBot:
         return self.play_locks[guild_id]
 
     async def _handle_play(self, interaction, query):
+        if interaction.guild is None:
+            return await self._temp_followup(
+                interaction,
+                "این دستور فقط داخل سرور قابل استفاده است.",
+            )
+
         guild_id = str(interaction.guild.id)
         channel = getattr(
             getattr(interaction.user, "voice", None),
@@ -851,17 +909,28 @@ class MusicBot:
         @self.bot.tree.command(name="play", description="پخش آهنگ از نام یا لینک")
         @app_commands.describe(query="نام آهنگ یا لینک")
         async def play(interaction: discord.Interaction, query: str):
-            # Start playback immediately. If Discord's 3-second acknowledgement
-            # window has already expired, that must not cancel the music task.
-            task = asyncio.create_task(self._handle_play(interaction, query))
+            if interaction.guild is None:
+                return await self._temp_response(
+                    interaction,
+                    "این دستور فقط داخل سرور قابل استفاده است.",
+                )
 
+            # Acknowledge first, then start the slow extraction/voice task.
+            # This removes the race where the background task reached followup
+            # before Discord had accepted the initial acknowledgement.
             try:
                 await interaction.response.defer(thinking=True)
             except discord.NotFound:
-                log.warning("play interaction expired before acknowledgement; continuing playback")
+                log.warning(
+                    "play interaction expired before acknowledgement; continuing playback"
+                )
             except discord.HTTPException as exc:
-                log.warning("play interaction acknowledgement failed: %s; continuing playback", exc)
+                log.warning(
+                    "play interaction acknowledgement failed: %s; continuing playback",
+                    exc,
+                )
 
+            task = asyncio.create_task(self._handle_play(interaction, query))
             task.add_done_callback(self._play_task_done)
 
         @self.bot.tree.command(name="loop", description="حالت تکرار پخش")
@@ -893,6 +962,11 @@ class MusicBot:
 
         @self.bot.tree.command(name="skip", description="آهنگ بعدی")
         async def skip(interaction):
+            if interaction.guild is None:
+                return await self._temp_response(
+                    interaction,
+                    "این دستور فقط داخل سرور قابل استفاده است.",
+                )
             await interaction.response.defer()
             player = self.player(str(interaction.guild.id))
 
@@ -913,6 +987,11 @@ class MusicBot:
 
         @self.bot.tree.command(name="stop", description="توقف و خروج از Voice")
         async def stop(interaction):
+            if interaction.guild is None:
+                return await self._temp_response(
+                    interaction,
+                    "این دستور فقط داخل سرور قابل استفاده است.",
+                )
             await interaction.response.defer()
             player = self.player(str(interaction.guild.id))
             await player.stop()
@@ -924,6 +1003,11 @@ class MusicBot:
 
         @self.bot.tree.command(name="queue", description="نمایش صف")
         async def queue(interaction):
+            if interaction.guild is None:
+                return await self._temp_response(
+                    interaction,
+                    "این دستور فقط داخل سرور قابل استفاده است.",
+                )
             player = self.player(str(interaction.guild.id))
             lines = (
                 [f"در حال پخش: {player.current.title}"]
@@ -938,6 +1022,11 @@ class MusicBot:
 
         @self.bot.tree.command(name="pause", description="مکث پخش")
         async def pause(interaction):
+            if interaction.guild is None:
+                return await self._temp_response(
+                    interaction,
+                    "این دستور فقط داخل سرور قابل استفاده است.",
+                )
             await interaction.response.defer()
             player = self.player(str(interaction.guild.id))
             if player.connection is None:
@@ -953,6 +1042,11 @@ class MusicBot:
 
         @self.bot.tree.command(name="resume", description="ادامه پخش")
         async def resume(interaction):
+            if interaction.guild is None:
+                return await self._temp_response(
+                    interaction,
+                    "این دستور فقط داخل سرور قابل استفاده است.",
+                )
             await interaction.response.defer()
             player = self.player(str(interaction.guild.id))
             if player.connection is None:
