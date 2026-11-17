@@ -23,6 +23,9 @@ log = logging.getLogger("mcord-music")
 
 intents = discord.Intents.default()
 intents.voice_states = True
+# Required for traditional prefix commands such as !play.
+# Also enable Message Content Intent in the Discord Developer Portal.
+intents.message_content = True
 
 
 def build_clients():
@@ -61,6 +64,10 @@ async def event_loop_watchdog():
 
 async def run_client(name, bot, token):
     @bot.event
+    async def on_connect():
+        log.info("%s gateway connected; waiting for READY.", name)
+
+    @bot.event
     async def on_ready():
         log.info("%s bot ready as %s", name, bot.user)
         try:
@@ -69,24 +76,51 @@ async def run_client(name, bot, token):
         except Exception:
             log.exception("%s slash command sync failed.", name)
 
+    @bot.event
+    async def on_disconnect():
+        log.warning("%s gateway disconnected.", name)
+
+    @bot.event
+    async def on_resumed():
+        log.info("%s gateway session resumed.", name)
+
     log.info("Starting %s bot gateway.", name)
-    await bot.start(token)
+    try:
+        await bot.start(token)
+        log.warning("%s bot gateway stopped normally.", name)
+    except discord.LoginFailure:
+        log.exception(
+            "%s login failed: token is invalid or belongs to a different bot.",
+            name,
+        )
+    except discord.PrivilegedIntentsRequired:
+        log.exception(
+            "%s login rejected: enable the required privileged intents "
+            "in the Discord Developer Portal.",
+            name,
+        )
+    except Exception:
+        log.exception("%s bot gateway crashed.", name)
+    finally:
+        if not bot.is_closed():
+            await bot.close()
 
 
 async def main():
     clients = build_clients()
     watchdog = asyncio.create_task(event_loop_watchdog())
+    tasks = [
+        asyncio.create_task(run_client(name, bot, token), name=f"{name}-gateway")
+        for name, bot, token in clients
+    ]
     try:
-        results = await asyncio.gather(
-            *(run_client(name, bot, token) for name, bot, token in clients),
-            return_exceptions=True,
-        )
-        for (name, _bot, _token), result in zip(clients, results):
-            if isinstance(result, BaseException):
-                log.error("%s bot stopped with an error: %s", name, result)
+        await asyncio.gather(*tasks)
     finally:
         watchdog.cancel()
-        await asyncio.gather(watchdog, return_exceptions=True)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(watchdog, *tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":
