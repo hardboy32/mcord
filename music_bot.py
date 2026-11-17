@@ -297,7 +297,7 @@ class GuildPlayer:
 
         target = query if is_url else f"scsearch1:{query}"
 
-        out_dir = Path(tempfile.gettempdir()) / "mcord_music"
+        out_dir = Path(tempfile.gettempdir()) / "mcord_music" / self.platform
         out_dir.mkdir(parents=True, exist_ok=True)
         out = out_dir / "sc-%(id)s.%(ext)s"
         ffmpeg_dir = str(Path(self.config.ffmpeg_path).resolve().parent)
@@ -463,7 +463,7 @@ class GuildPlayer:
             # Current Piped returns a pipedproxy URL here. Downloading that
             # URL keeps the media transfer away from YouTube/googlevideo and
             # is the important part that lets this work from datacenter hosts.
-            out_dir = Path(tempfile.gettempdir()) / "mcord_music"
+            out_dir = Path(tempfile.gettempdir()) / "mcord_music" / self.platform
             out_dir.mkdir(parents=True, exist_ok=True)
             safe_id = "".join(ch for ch in vid if ch.isalnum() or ch in "-_")[:80] or "audio"
             mime = preferred.get("mimeType") or ""
@@ -565,7 +565,7 @@ class GuildPlayer:
         except Exception as exc:
             log.warning("Piped extraction failed: %s", exc)
 
-        d = Path(tempfile.gettempdir()) / "mcord_music"
+        d = Path(tempfile.gettempdir()) / "mcord_music" / self.platform
         d.mkdir(parents=True, exist_ok=True)
         out = d / "%(id)s.%(ext)s"
         target = query if query.startswith(("http://", "https://")) else "ytsearch1:" + query
