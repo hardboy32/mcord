@@ -810,7 +810,6 @@ class GuildPlayer:
                         t.path,
                     )
                     await self._play_track(t)
-                    log.info("Audio playback started/finished: title=%s", t.title)
                     log.info("Audio playback finished: title=%s", t.title)
                 except asyncio.CancelledError:
                     raise
@@ -894,9 +893,12 @@ class GuildPlayer:
 
         if self.connection is not None:
             try:
-                await self.connection.stop()
+                if self.platform == "discord":
+                    self.connection.stop()
+                else:
+                    await self.connection.stop()
             except Exception:
-                pass
+                log.exception("voice stop failed")
 
         self.current = None
 
