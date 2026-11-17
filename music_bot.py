@@ -993,21 +993,42 @@ class MusicBot:
         if exc:
             log.error("background play task failed: %s", exc, exc_info=exc)
 
+    async def _delete_message_later(self, message):
+        await asyncio.sleep(10)
+        try:
+            await message.delete()
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
     async def _temp_followup(self, interaction, content: str):
-        """Send a bot message that Discord deletes automatically after 10s."""
-        return await interaction.followup.send(
-            content,
-            wait=True,
-            delete_after=10,
-        )
+        """Send a short-lived reply on either platform."""
+        if self.platform == "mcord":
+            return await interaction.followup.send(
+                content,
+                wait=True,
+                delete_after=10,
+            )
+
+        message = await interaction.followup.send(content, wait=True)
+        asyncio.create_task(self._delete_message_later(message))
+        return message
 
     async def _temp_response(self, interaction, content: str, **kwargs):
-        """Send an interaction response that Discord deletes automatically after 10s."""
-        return await interaction.response.send_message(
-            content,
-            delete_after=10,
-            **kwargs,
-        )
+        """Send a short-lived initial response on either platform."""
+        if self.platform == "mcord":
+            return await interaction.response.send_message(
+                content,
+                delete_after=10,
+                **kwargs,
+            )
+
+        await interaction.response.send_message(content, **kwargs)
+        try:
+            message = await interaction.original_response()
+            asyncio.create_task(self._delete_message_later(message))
+        except (discord.NotFound, discord.HTTPException):
+            log.debug("Could not schedule deletion of interaction response.")
+        return None
 
     def register(self):
         @self.bot.tree.command(name="play", description="پخش آهنگ از نام یا لینک")
