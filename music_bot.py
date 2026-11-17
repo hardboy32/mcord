@@ -560,7 +560,7 @@ class GuildPlayer:
         )
 
     async def download(self, query):
-        # SoundCloud works independently of the YouTube egress block seen on Infrlo.
+        # SoundCloud is an independent fallback when YouTube access is restricted by the host network.
         try:
             return await self._download_from_soundcloud(query)
         except Exception as exc:
