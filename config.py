@@ -26,12 +26,10 @@ class Config:
     ffmpeg_path: str = "ffmpeg"
 
     @classmethod
-    def from_env(cls) -> "Config":
-        token = os.getenv("MCORD_BOT_TOKEN", "").strip()
+    def from_env(cls, token_variable: str) -> "Config | None":
+        token = os.getenv(token_variable, "").strip()
         if not token:
-            raise RuntimeError(
-                "MCORD_BOT_TOKEN is not set. Add only the Bot Token as an Infrlo environment variable."
-            )
+            return None
 
         return cls(
             bot_token=token,
