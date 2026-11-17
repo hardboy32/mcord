@@ -77,9 +77,13 @@ async def main():
     clients = build_clients()
     watchdog = asyncio.create_task(event_loop_watchdog())
     try:
-        await asyncio.gather(
-            *(run_client(name, bot, token) for name, bot, token in clients)
+        results = await asyncio.gather(
+            *(run_client(name, bot, token) for name, bot, token in clients),
+            return_exceptions=True,
         )
+        for (name, _bot, _token), result in zip(clients, results):
+            if isinstance(result, BaseException):
+                log.error("%s bot stopped with an error: %s", name, result)
     finally:
         watchdog.cancel()
         await asyncio.gather(watchdog, return_exceptions=True)
