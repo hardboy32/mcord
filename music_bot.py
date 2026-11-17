@@ -601,9 +601,22 @@ class GuildPlayer:
                 )
                 log.info("YouTube cookies loaded from YOUTUBE_COOKIES_B64.")
             except Exception:
-                cookies_file = ""
+                log.exception("Could not decode YOUTUBE_COOKIES_B64.")
+
+        # Prefer an explicitly configured cookie file or Base64 value. If neither
+        # is supplied, use the cookie file committed under Config/ in this repo.
+        if not cookies_file or not Path(cookies_file).is_file():
+            bundled_cookies = (
+                Path(__file__).resolve().parent / "Config" / "youtube_cookies.txt"
+            )
+            if bundled_cookies.is_file():
+                cookies_file = str(bundled_cookies)
+                log.info("YouTube cookies loaded from Config/youtube_cookies.txt.")
+
         if cookies_file and Path(cookies_file).is_file():
             cmd += ["--cookies", cookies_file]
+        else:
+            log.warning("No YouTube cookies file found; using unauthenticated extraction.")
 
         proxy = self._pick_proxy()
         user_agent = self._user_agent()
