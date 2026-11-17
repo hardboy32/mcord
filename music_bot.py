@@ -57,8 +57,9 @@ class Track:
 
 
 class GuildPlayer:
-    def __init__(self, config):
+    def __init__(self, config, platform="mcord"):
         self.config = config
+        self.platform = platform
         self.voice = None
         self.connection = None
         self.queue = []
@@ -82,12 +83,23 @@ class GuildPlayer:
             api_base=self.config.api_base,
         )
 
-    async def join(self, guild_id, channel_id):
-        if self.connection is not None and getattr(self.connection, "channel_id", None) == channel_id:
+    async def join(self, guild_id, channel):
+        channel_id = str(getattr(channel, "id", channel))
+        current_channel = (
+            getattr(getattr(self.connection, "channel", None), "id", None)
+            if self.platform == "discord"
+            else getattr(self.connection, "channel_id", None)
+        )
+        if self.connection is not None and str(current_channel) == channel_id:
             return
 
         if self.connection is not None:
             await self._leave_connection_only()
+
+        if self.platform == "discord":
+            self.connection = await channel.connect(timeout=30, reconnect=True)
+            log.info("Discord voice connected guild=%s channel=%s", guild_id, channel_id)
+            return
 
         # IMPORTANT: mcord_voice/LiveKit already has its own ICE retry loop.
         # Do not wrap voice.join() in a short asyncio.wait_for(), otherwise
@@ -140,7 +152,10 @@ class GuildPlayer:
     async def _leave_connection_only(self):
         if self.connection is not None:
             try:
-                await self.connection.leave()
+                if self.platform == "discord":
+                    await self.connection.disconnect(force=True)
+                else:
+                    await self.connection.leave()
             except Exception:
                 log.exception("voice leave failed")
             self.connection = None
@@ -152,7 +167,7 @@ class GuildPlayer:
 
         await self._leave_connection_only()
 
-        if self.voice is not None:
+        if self.platform == "mcord" and self.voice is not None:
             try:
                 await self.voice.shutdown()
             except Exception:
@@ -701,6 +716,66 @@ class GuildPlayer:
             except Exception:
                 log.exception("wait_until_idle failed after duration-based wait")
 
+    async def _play_track(self, track: Track):
+        if self.platform == "mcord":
+            resource = await asyncio.to_thread(
+                create_audio_resource,
+                str(track.path),
+                ffmpeg_path=self.config.ffmpeg_path,
+            )
+            await self.connection.play(resource)
+            await self._wait_for_playback_end(track.path)
+            return
+
+        loop = asyncio.get_running_loop()
+        finished = loop.create_future()
+
+        def after_playback(error):
+            def resolve():
+                if finished.done():
+                    return
+                if error:
+                    finished.set_exception(error)
+                else:
+                    finished.set_result(None)
+            loop.call_soon_threadsafe(resolve)
+
+        source = discord.FFmpegPCMAudio(
+            str(track.path),
+            executable=self.config.ffmpeg_path,
+        )
+        try:
+            self.connection.play(source, after=after_playback)
+            await finished
+        finally:
+            source.cleanup()
+
+    async def pause(self):
+        if self.connection is None:
+            return
+        if self.platform == "discord":
+            self.connection.pause()
+        else:
+            await self.connection.pause()
+
+    async def resume(self):
+        if self.connection is None:
+            return
+        if self.platform == "discord":
+            self.connection.resume()
+        else:
+            await self.connection.resume()
+
+    async def skip_current(self):
+        if self.connection is None:
+            return
+        if self.playback_interrupt is not None:
+            self.playback_interrupt.set()
+        if self.platform == "discord":
+            self.connection.stop()
+        else:
+            await self.connection.stop()
+
     async def play_next(self):
         if self.connection is None or self._playback_running:
             if self.connection is None:
@@ -734,17 +809,8 @@ class GuildPlayer:
                         t.title,
                         t.path,
                     )
-                    resource = await asyncio.to_thread(
-                        create_audio_resource,
-                        str(t.path),
-                        ffmpeg_path=self.config.ffmpeg_path,
-                    )
-                    log.info("Audio resource ready: title=%s", t.title)
-
-                    await self.connection.play(resource)
-                    log.info("Audio playback started: title=%s", t.title)
-
-                    await self._wait_for_playback_end(t.path)
+                    await self._play_track(t)
+                    log.info("Audio playback started/finished: title=%s", t.title)
                     log.info("Audio playback finished: title=%s", t.title)
                 except asyncio.CancelledError:
                     raise
@@ -836,9 +902,10 @@ class GuildPlayer:
 
 
 class MusicBot:
-    def __init__(self, bot, config):
+    def __init__(self, bot, config, platform="mcord"):
         self.bot = bot
         self.config = config
+        self.platform = platform
         self.players = {}
         # Keep one play operation per guild at a time. Voice connection
         # negotiation can take several seconds on hosted environments, and
@@ -847,7 +914,7 @@ class MusicBot:
 
     def player(self, guild_id):
         if guild_id not in self.players:
-            self.players[guild_id] = GuildPlayer(self.config)
+            self.players[guild_id] = GuildPlayer(self.config, self.platform)
         return self.players[guild_id]
 
     def play_lock(self, guild_id):
@@ -892,7 +959,7 @@ class MusicBot:
                 # allowed to finish its own LiveKit/ICE retry cycle.
                 await player.join(
                     guild_id,
-                    str(channel.id),
+                    channel,
                 )
 
                 track.requested_by = str(interaction.user)
@@ -1014,7 +1081,7 @@ class MusicBot:
             if player.playback_interrupt is not None:
                 player.playback_interrupt.set()
 
-            await player.connection.stop()
+            await player.skip_current()
             await self._temp_followup(
                 interaction,
                 "رفتن به آهنگ بعدی.",
@@ -1069,7 +1136,7 @@ class MusicBot:
                     interaction,
                     "چیزی در حال پخش نیست.",
                 )
-            await player.connection.pause()
+            await player.pause()
             await self._temp_followup(
                 interaction,
                 "پخش مکث شد.",
@@ -1089,7 +1156,7 @@ class MusicBot:
                     interaction,
                     "چیزی برای ادامه نیست.",
                 )
-            await player.connection.resume()
+            await player.resume()
             await self._temp_followup(
                 interaction,
                 "پخش ادامه پیدا کرد.",
