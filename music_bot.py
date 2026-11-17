@@ -90,7 +90,14 @@ class GuildPlayer:
             if self.platform == "discord"
             else getattr(self.connection, "channel_id", None)
         )
-        if self.connection is not None and str(current_channel) == channel_id:
+        connected = (
+            self.connection is not None
+            and (
+                self.platform != "discord"
+                or self.connection.is_connected()
+            )
+        )
+        if connected and str(current_channel) == channel_id:
             return
 
         if self.connection is not None:
